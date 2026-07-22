@@ -1,11 +1,14 @@
 {
-  "name": "com.kadu999.device-decoder",
+  "name": "com.kadu999.device-pipe",
   "version": "1.0.0",
-  "displayName": "DeviceDecoder",
-  "description": "Binary protocol frame decoder with CRC, ring buffer, and pressure analysis.",
+  "displayName": "DevicePipe",
+  "description": "Device data pipeline: serial reader, frame decoder, CRC, and pressure analysis.",
   "unity": "2022.3",
+  "dependencies": {
+    "com.kadu999.device-link": "1.0.0"
+  },
   "author": {
     "name": "kadu999",
-    "url": "https://github.com/kadu999/DeviceDecoder"
+    "url": "https://github.com/kadu999/DevicePipe"
   }
 }

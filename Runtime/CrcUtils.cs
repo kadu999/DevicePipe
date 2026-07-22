@@ -1,6 +1,6 @@
 using System;
 
-namespace DeviceDecoder
+namespace DevicePipe
 {
     internal static class CrcUtils
     {

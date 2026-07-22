@@ -4,7 +4,7 @@ using System.Linq;
 using System.Text;
 using UnityEngine;
 
-namespace DeviceDecoder
+namespace DevicePipe
 {
     /// <summary>
     /// Parses a byte stream into protocol frames. Ported from UnityViewer DataAnalysis.cs.

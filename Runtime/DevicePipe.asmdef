@@ -1,6 +1,9 @@
 {
-    "name": "DeviceDecoder",
-    "rootNamespace": "DeviceDecoder",
+    "name": "DevicePipe",
+    "rootNamespace": "DevicePipe",
+    "references": [
+        "DeviceLink"
+    ],
     "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,

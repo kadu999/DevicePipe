@@ -1,6 +1,6 @@
 using System;
 
-namespace DeviceDecoder
+namespace DevicePipe
 {
     /// <summary>Thread-safe circular byte buffer.</summary>
     public class RingBuffer

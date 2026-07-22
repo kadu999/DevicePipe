@@ -1,4 +1,4 @@
-namespace DeviceDecoder
+namespace DevicePipe
 {
     public enum ChecksumType
     {
