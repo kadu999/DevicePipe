@@ -1,0 +1,13 @@
+{
+    "name": "DeviceDecoder",
+    "rootNamespace": "DeviceDecoder",
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -1,0 +1,11 @@
+{
+  "name": "com.kadu999.device-decoder",
+  "version": "1.0.0",
+  "displayName": "DeviceDecoder",
+  "description": "Binary protocol frame decoder with CRC, ring buffer, and pressure analysis.",
+  "unity": "2022.3",
+  "author": {
+    "name": "kadu999",
+    "url": "https://github.com/kadu999/DeviceDecoder"
+  }
+}
