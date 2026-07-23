@@ -10,6 +10,8 @@ namespace DevicePipe
         public float radius;
     }
 
+    public enum RadiusMode { Direction, Square }
+
     public static class PressureAnalyzer
     {
         const int Threshold = 3;
@@ -30,7 +32,8 @@ namespace DevicePipe
             _bufB = new float[w, h];
         }
 
-        public static PressureInfo[] GetPressureInfo(int[] data, int width, int height)
+        public static PressureInfo[] GetPressureInfo(int[] data, int width, int height,
+                                                      RadiusMode mode = RadiusMode.Direction)
         {
             EnsureKernel();
             Resize(width, height);
@@ -100,7 +103,12 @@ namespace DevicePipe
                     if (d < MergeDist) { tooClose = true; break; }
                 }
                 if (!tooClose)
-                    result.Add(new PressureInfo { x = p.x, y = p.y, pressure = (int)p.val, radius = ComputeRadiusByDirection(p.x, p.y, p.val) });
+                {
+                    float r = mode == RadiusMode.Square
+                        ? ComputeRadiusBySquare(_bufB, p.x, p.y, absoluteThreshold: 3f)
+                        : ComputeRadiusByDirection(p.x, p.y, p.val);
+                    result.Add(new PressureInfo { x = p.x, y = p.y, pressure = (int)p.val, radius = r });
+                }
             }
             return result.ToArray();
         }
