@@ -100,12 +100,12 @@ namespace DevicePipe
                     if (d < MergeDist) { tooClose = true; break; }
                 }
                 if (!tooClose)
-                    result.Add(new PressureInfo { x = p.x, y = p.y, pressure = (int)p.val, radius = ComputeRadius(p.x, p.y, p.val) });
+                    result.Add(new PressureInfo { x = p.x, y = p.y, pressure = (int)p.val, radius = ComputeRadiusByDirection(p.x, p.y, p.val) });
             }
             return result.ToArray();
         }
 
-        static float ComputeRadius(int cx, int cy, float peakVal)
+        static float ComputeRadiusByDirection(int cx, int cy, float peakVal)
         {
             float threshold = Mathf.Max(peakVal * 0.3f, 3f);
             int maxDist = 50;
@@ -117,6 +117,41 @@ namespace DevicePipe
             while (down < maxDist && cy + down + 1 < _h && _bufB[cx, cy + down + 1] > threshold) down++;
 
             return (left + right + up + down) / 4f + 1f;
+        }
+
+        /// <summary>
+        /// Python-style uniform square expansion radius estimator.
+        /// Grows a square around the peak until any boundary pixel drops below absoluteThreshold.
+        /// (Not currently used — saved for comparison.)
+        /// </summary>
+        static float ComputeRadiusBySquare(float[,] smoothed, int cx, int cy, float absoluteThreshold, int maxR = 50)
+        {
+            int h = smoothed.GetLength(1);
+            int w = smoothed.GetLength(0);
+            int r = 1;
+            while (r < maxR && r < Mathf.Max(w, h))
+            {
+                int yMin = Mathf.Max(0, cy - r);
+                int yMax = Mathf.Min(h - 1, cy + r);
+                int xMin = Mathf.Max(0, cx - r);
+                int xMax = Mathf.Min(w - 1, cx + r);
+
+                bool below = false;
+                for (int x = xMin; x <= xMax && !below; x++)
+                {
+                    if (smoothed[x, yMin] < absoluteThreshold) below = true;
+                    if (smoothed[x, yMax] < absoluteThreshold) below = true;
+                }
+                for (int y = yMin; y <= yMax && !below; y++)
+                {
+                    if (smoothed[xMin, y] < absoluteThreshold) below = true;
+                    if (smoothed[xMax, y] < absoluteThreshold) below = true;
+                }
+
+                if (below && r > 1) break;
+                r++;
+            }
+            return r;
         }
 
         static void EnsureKernel()
