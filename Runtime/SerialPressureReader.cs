@@ -9,7 +9,7 @@ namespace DevicePipe
     /// </summary>
     public class SerialPressureReader
     {
-        public event System.Action<int[]> OnFrame;
+        public event System.Action<int[], int, int> OnFrame;
 
         readonly ProtocolConfig _config;
         readonly bool _useWin;
@@ -17,6 +17,9 @@ namespace DevicePipe
         DeviceLink.WinSerialBridge _winSerial;
         DeviceLink.SerialPortBridge _serial;
         FrameDecoder _decoder;
+
+        int[] _data;
+        PressureInfo[] _touches;
 
         public bool IsOpen
         {
@@ -53,7 +56,7 @@ namespace DevicePipe
             if (_decoder != null) return; // already opened
 
             _decoder = new FrameDecoder(_config);
-            _decoder.OnFrame += data => OnFrame?.Invoke(data);
+            _decoder.OnFrame += UpdateData;
 
             if (_useWin)
             {
@@ -86,6 +89,22 @@ namespace DevicePipe
             _decoder = null;
             _winSerial = null;
             _serial = null;
+        }
+
+        private void UpdateData(int[] data)
+        {
+            _data = data;
+            _touches = null;
+            OnFrame?.Invoke(data, _config.RowCount, _config.ColCount);
+        }
+
+        public  PressureInfo[] GetPressureInfo()
+        {
+            if (_data != null && _touches == null)
+            {
+                _touches = PressureAnalyzer.GetPressureInfo(_data, _config.RowCount, _config.ColCount);
+            }
+            return _touches;
         }
     }
 }
