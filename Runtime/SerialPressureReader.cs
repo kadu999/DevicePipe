@@ -61,14 +61,14 @@ namespace DevicePipe
             if (_useWin)
             {
                 _winSerial = new DeviceLink.WinSerialBridge();
-                _winSerial.OnDataReceived += data => _decoder?.Feed(data);
+                _winSerial.OnDataReceived += (buf, off, len) => _decoder?.Feed(buf, off, len);
                 var port = ResolvePort(portName, DeviceLink.WinSerialBridge.GetPortNames());
                 if (!string.IsNullOrEmpty(port)) _winSerial.Open(port, baudRate);
             }
             else
             {
                 _serial = new DeviceLink.SerialPortBridge();
-                _serial.OnDataReceived += data => _decoder?.Feed(data);
+                _serial.OnDataReceived += (buf, off, len) => _decoder?.Feed(buf, off, len);
                 _serial.OnError += e => Debug.LogWarning($"[Serial] {e}");
                 var port = ResolvePort(portName, DeviceLink.SerialPortBridge.GetPortNames());
                 if (!string.IsNullOrEmpty(port)) _serial.Open(port, baudRate);
