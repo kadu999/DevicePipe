@@ -347,21 +347,48 @@ namespace DevicePipe
             // ── Area filter ──
             if (comp.pixelCount < MinRingArea) return false;
 
-            float cx = (float)comp.sumX / comp.pixelCount;
-            float cy = (float)comp.sumY / comp.pixelCount;
-
-            // ── Collect component pixels for ellipse + ordering ──
+            // ── Collect component pixels ──
             int total = w * h;
             var points = new List<(int x, int y)>(comp.pixelCount);
             for (int i = 0; i < total; i++)
                 if (labels[i] == compId)
                     points.Add((i / h, i % h));
 
-            // Sort by angle around centroid (for polygon area/perimeter)
+            // ── Robust center: filter out lever pixels by distance ──
+            // Mean center is biased toward lever; ring pixels all sit at ~same
+            // distance from true center. Filter to the dominant distance band.
+            float cx0 = (float)comp.sumX / comp.pixelCount;
+            float cy0 = (float)comp.sumY / comp.pixelCount;
+
+            var dists = new float[points.Count];
+            for (int i = 0; i < points.Count; i++)
+                dists[i] = Mathf.Sqrt((points[i].x - cx0) * (points[i].x - cx0)
+                                    + (points[i].y - cy0) * (points[i].y - cy0));
+            System.Array.Sort(dists);
+            float medDist = dists[points.Count / 2];
+
+            // Recompute center from pixels near median distance (ring pixels)
+            float cx = 0f, cy = 0f;
+            int ringCount = 0;
+            float lo = medDist * 0.5f, hi = medDist * 1.5f;
+            for (int i = 0; i < points.Count; i++)
+            {
+                float d = Mathf.Sqrt((points[i].x - cx0) * (points[i].x - cx0)
+                                   + (points[i].y - cy0) * (points[i].y - cy0));
+                if (d >= lo && d <= hi)
+                {
+                    cx += points[i].x; cy += points[i].y; ringCount++;
+                }
+            }
+            if (ringCount < MinRingArea) return false;
+            cx /= ringCount; cy /= ringCount;
+
+            // Sort by angle around robust centroid (for polygon area/perimeter)
+            float sortCx = cx, sortCy = cy;
             points.Sort((a, b) =>
             {
-                float angA = Mathf.Atan2(a.y - cy, a.x - cx);
-                float angB = Mathf.Atan2(b.y - cy, b.x - cx);
+                float angA = Mathf.Atan2(a.y - sortCy, a.x - sortCx);
+                float angB = Mathf.Atan2(b.y - sortCy, b.x - sortCx);
                 return angA.CompareTo(angB);
             });
 
