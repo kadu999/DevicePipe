@@ -406,8 +406,8 @@ namespace DevicePipe
 
             if (lambda2 < 1e-6f) return false; // degenerate
 
-            float major = 2f * Mathf.Sqrt(lambda1);
-            float minor = 2f * Mathf.Sqrt(lambda2);
+            float major = 2f * Mathf.Sqrt(2f * lambda1);
+            float minor = 2f * Mathf.Sqrt(2f * lambda2);
 
             // Eigenvector for major axis → ellipse orientation angle
             float angle = 0f;
