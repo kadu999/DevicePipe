@@ -17,6 +17,11 @@ namespace DevicePipe
         int _parsedFrames;
         int _badFrames;
 
+        // FPS measurement
+        readonly System.Diagnostics.Stopwatch _sw = System.Diagnostics.Stopwatch.StartNew();
+        int _lastFpsFrames;
+        float _framesPerSecond;
+
         /// <summary>Parsed frames waiting to be consumed by main thread.</summary>
         readonly System.Collections.Concurrent.ConcurrentQueue<int[]> _frameQueue = new();
 
@@ -26,6 +31,23 @@ namespace DevicePipe
         public int BadFrameCount => _badFrames;
         public int BufferedByteCount => _buffer.Count;
         public int QueuedFrameCount => _frameQueue.Count;
+
+        /// <summary>Estimated frames per second, updated every second.</summary>
+        public float FramesPerSecond
+        {
+            get
+            {
+                long elapsed = _sw.ElapsedMilliseconds;
+                if (elapsed >= 1000)
+                {
+                    float delta = elapsed / 1000f;
+                    _framesPerSecond = (_parsedFrames - _lastFpsFrames) / delta;
+                    _lastFpsFrames = _parsedFrames;
+                    _sw.Restart();
+                }
+                return _framesPerSecond;
+            }
+        }
 
         public event Action<string> OnError;
 
