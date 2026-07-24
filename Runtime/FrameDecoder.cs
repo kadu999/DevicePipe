@@ -80,18 +80,22 @@ namespace DevicePipe
             _badFrames = 0;
         }
 
-        // ── Ported from DataAnalysis.DataAnalysisThread ──
-
-        byte[] _readBuf = new byte[230400 / 5];
+        // ── Scratch buffer for frame operations ──
+        // Sized for a full 100x100@16bit frame: ~20KB + head + checksum
+        byte[] _readBuf = new byte[23040];
+        // Smaller buffer for header scanning — 4KB on stack avoids heap alloc
+        byte[] _scanBuf = new byte[4096];
 
         void TryDecode()
         {
-            // Row*Col threshold
+            // Row*Col threshold (single Count access — cheap, one lock)
             if (_buffer.Count < _config.RowCount * _config.ColCount) return;
 
-            // Find header directly in ring buffer (no copy, no hex)
-            int searchLen = Math.Min(_buffer.Count, 4096);
-            int headBytePos = FindHeaderInBuffer(searchLen);
+            // Find header by scanning a batched copy (single lock) instead of
+            // per-byte indexer calls (each with its own lock).
+            int searchLen = Math.Min(_buffer.Count, _scanBuf.Length);
+            _buffer.ReadBatch(_scanBuf, 0, searchLen);
+            int headBytePos = FindHeaderInBuffer(_scanBuf, searchLen);
             if (headBytePos < 0)
             {
                 if (_buffer.Count > _readBuf.Length / 2)
@@ -100,13 +104,15 @@ namespace DevicePipe
             }
             if (headBytePos > 0) { _buffer.Discard(headBytePos); return; }
 
-            // Verify header bytes
+            // Verify header bytes (re-read after discard — head is now at position 0)
             if (_buffer.Count < 3) return;
-            if (_buffer[0] != 0xA5 || _buffer[1] != 0x5A || _buffer[2] != 0x01) { _buffer.Discard(1); return; }
+            _buffer.ReadBatch(_scanBuf, 0, 3);
+            if (_scanBuf[0] != 0xA5 || _scanBuf[1] != 0x5A || _scanBuf[2] != 0x01) { _buffer.Discard(1); return; }
 
             // Read length field (bytes 3-4, little-endian)
             if (_buffer.Count < 5) return;
-            int rawLen = _buffer[3] + _buffer[4] * 256;
+            _buffer.ReadBatch(_scanBuf, 0, 5);
+            int rawLen = _scanBuf[3] + _scanBuf[4] * 256;
             int dataBytes = rawLen - _config.HeadLen;
             if (dataBytes <= 0) { _buffer.Discard(1); return; }
 
@@ -114,9 +120,8 @@ namespace DevicePipe
             int frameByteLen = _config.HeadLen + dataBytes + ChecksumLen();
             if (_buffer.Count < frameByteLen) return;
 
-            // Copy frame to local buffer for checksum
-            for (int i = 0; i < frameByteLen; i++)
-                _readBuf[i] = _buffer[i];
+            // Batch-copy the entire frame in one lock
+            _buffer.ReadBatch(_readBuf, 0, frameByteLen);
 
             bool checksumOk = SumCheck(_readBuf, 0, frameByteLen);
             if (!checksumOk) { _badFrames++; DumpChecksumFail(0, frameByteLen * 2); }
@@ -126,12 +131,44 @@ namespace DevicePipe
             _buffer.Discard(frameByteLen);
         }
 
-        int FindHeaderInBuffer(int len)
+        int FindHeaderInBuffer(byte[] buf, int len)
         {
             for (int i = 0; i < len - 2; i++)
-                if (_buffer[i] == 0xA5 && _buffer[i + 1] == 0x5A && _buffer[i + 2] == 0x01)
+                if (buf[i] == 0xA5 && buf[i + 1] == 0x5A && buf[i + 2] == 0x01)
                     return i;
             return -1;
+        }
+
+        // ── CRC32 Mpeg2 lookup table (precomputed once, O(1)/byte) ──
+        static readonly uint[] _crc32Table = BuildCrc32Table();
+
+        static uint[] BuildCrc32Table()
+        {
+            var table = new uint[256];
+            for (int i = 0; i < 256; i++)
+            {
+                uint crc = (uint)i << 24;
+                for (int j = 0; j < 8; j++)
+                    crc = (crc & 0x80000000) != 0 ? (crc << 1) ^ 0x04C11DB7 : crc << 1;
+                table[i] = crc;
+            }
+            return table;
+        }
+
+        // ── CRC16 Modbus lookup table (precomputed once, O(1)/byte) ──
+        static readonly ushort[] _crc16Table = BuildCrc16Table();
+
+        static ushort[] BuildCrc16Table()
+        {
+            var table = new ushort[256];
+            for (int i = 0; i < 256; i++)
+            {
+                ushort crc = (ushort)i;
+                for (int j = 0; j < 8; j++)
+                    crc = (crc & 1) != 0 ? (ushort)((crc >> 1) ^ 0xA001) : (ushort)(crc >> 1);
+                table[i] = crc;
+            }
+            return table;
         }
 
         // ── Ported from DataAnalysis.SumCheck ──
@@ -149,76 +186,41 @@ namespace DevicePipe
 
         bool SumCheck_Sum16(byte[] cmd, int start, int len)
         {
-            byte[] checkData = new byte[2];
-            checkData[0] = cmd[start + len - 2];
-            checkData[1] = cmd[start + len - 1];
-
             short temp = 0;
             for (int i = start; i < len + start - 2; i++)
                 temp += (short)cmd[i];
 
-            byte[] sum = new byte[2];
-            sum[0] = (byte)(temp & 0xFF);
-            sum[1] = (byte)(temp >> 8 & 0xFF);
-
-            return sum.SequenceEqual(checkData);
+            return cmd[start + len - 2] == (byte)(temp & 0xFF)
+                && cmd[start + len - 1] == (byte)(temp >> 8 & 0xFF);
         }
 
         bool SumCheck_CRC16(byte[] cmd, int start, int len)
         {
-            byte[] checkData = new byte[2];
-            checkData[0] = cmd[start + len - 2];
-            checkData[1] = cmd[start + len - 1];
-
             ushort crc = 0xFFFF;
-            for (int i = start; i < len + start - 2; i++)
-            {
-                crc ^= cmd[i];
-                for (byte j = 0; j < 8; j++)
-                {
-                    if ((crc & 0x0001) != 0)
-                    {
-                        crc >>= 1;
-                        crc ^= 0xA001;
-                    }
-                    else
-                    {
-                        crc >>= 1;
-                    }
-                }
-            }
+            int end = len + start - 2;
+            for (int i = start; i < end; i++)
+                crc = (ushort)((crc >> 8) ^ _crc16Table[(crc ^ cmd[i]) & 0xFF]);
 
-            return BitConverter.GetBytes(crc).SequenceEqual(checkData);
+            var bytes = BitConverter.GetBytes(crc);
+            return bytes[0] == cmd[start + len - 2] && bytes[1] == cmd[start + len - 1];
         }
 
         bool SumCheck_CRC32(byte[] cmd, int start, int len)
         {
-            byte[] checkData = new byte[4];
-            checkData[0] = cmd[start + len - 4];
-            checkData[1] = cmd[start + len - 3];
-            checkData[2] = cmd[start + len - 2];
-            checkData[3] = cmd[start + len - 1];
-
             uint crc = 0xFFFFFFFF;
-            for (int j = start; j < len + start - 4; j++)
-            {
-                crc ^= (uint)cmd[j] << 24;
-                for (int i = 0; i < 8; ++i)
-                {
-                    if ((crc & 0x80000000) != 0)
-                        crc = (crc << 1) ^ 0x04C11DB7;
-                    else
-                        crc <<= 1;
-                }
-            }
+            int end = len + start - 4;
+            for (int j = start; j < end; j++)
+                crc = (crc << 8) ^ _crc32Table[(byte)(crc >> 24) ^ cmd[j]];
 
-            byte[] result = new byte[4];
-            result[3] = (byte)(crc & 0xFF);
-            result[2] = (byte)((crc & 0xFF00) >> 8);
-            result[1] = (byte)((crc & 0xFF0000) >> 16);
-            result[0] = (byte)((crc >> 24) & 0xFF);
+            byte crc3 = (byte)((crc >> 24) & 0xFF);
+            byte crc2 = (byte)((crc >> 16) & 0xFF);
+            byte crc1 = (byte)((crc >> 8) & 0xFF);
+            byte crc0 = (byte)(crc & 0xFF);
 
-            return result.SequenceEqual(checkData);
+            return cmd[start + len - 4] == crc3
+                && cmd[start + len - 3] == crc2
+                && cmd[start + len - 2] == crc1
+                && cmd[start + len - 1] == crc0;
         }
 
         void DumpChecksumFail(int headIndex, int len)
@@ -232,7 +234,8 @@ namespace DevicePipe
             if (_config.Checksum == ChecksumType.CRC16_Modbus)
             {
                 ushort crc = 0xFFFF;
-                for (int i = s; i < l + s - 2; i++) { crc ^= _readBuf[i]; for (int j = 0; j < 8; j++) crc = (crc & 1) != 0 ? (ushort)((crc >> 1) ^ 0xA001) : (ushort)(crc >> 1); }
+                for (int i = s; i < l + s - 2; i++)
+                    crc = (ushort)((crc >> 8) ^ _crc16Table[(crc ^ _readBuf[i]) & 0xFF]);
                 sb.AppendLine($"  Computed: {crc:X4}  Expected: {_readBuf[s + l - 2]:X2}{_readBuf[s + l - 1]:X2}");
             }
             else if (_config.Checksum == ChecksumType.Sum16)

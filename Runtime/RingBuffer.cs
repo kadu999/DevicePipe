@@ -68,6 +68,27 @@ namespace DevicePipe
             }
         }
 
+        /// <summary>
+        /// Batch-read bytes into a destination buffer WITHOUT modifying the read head.
+        /// Useful for frame scanning / header detection — avoids per-byte lock overhead.
+        /// Returns actual number of bytes copied.
+        /// </summary>
+        public int ReadBatch(byte[] dst, int dstOffset, int count)
+        {
+            lock (_lock)
+            {
+                int actual = Math.Min(count, _count);
+                if (actual <= 0) return 0;
+
+                int first = Math.Min(actual, _buf.Length - _start);
+                Array.Copy(_buf, _start, dst, dstOffset, first);
+                int second = actual - first;
+                if (second > 0)
+                    Array.Copy(_buf, 0, dst, dstOffset + first, second);
+                return actual;
+            }
+        }
+
         public void Discard(int count)
         {
             lock (_lock)
