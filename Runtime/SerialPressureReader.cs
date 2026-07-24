@@ -20,6 +20,7 @@ namespace DevicePipe
 
         int[] _data;
         PressureInfo[] _touches;
+        ChessPieceInfo[] _pieces;
 
         public bool IsOpen
         {
@@ -29,6 +30,12 @@ namespace DevicePipe
                 return _serial != null && _serial.IsOpen;
             }
         }
+
+        public float FrameRate => _decoder?.FramesPerSecond ?? 0f;
+        public int FrameCount => _decoder?.ParsedFrameCount ?? 0;
+        public int BadFrameCount => _decoder?.BadFrameCount ?? 0;
+        public int QueuedFrames => _decoder?.QueuedFrameCount ?? 0;
+        public int BufferedBytes => _decoder?.BufferedByteCount ?? 0;
 
         public SerialPressureReader(int row, int col, bool useWinSerialBridge = false)
             : this(new ProtocolConfig
@@ -95,6 +102,7 @@ namespace DevicePipe
         {
             _data = data;
             _touches = null;
+            _pieces = null;
             OnFrame?.Invoke(data, _config.RowCount, _config.ColCount);
         }
 
@@ -105,6 +113,15 @@ namespace DevicePipe
                 _touches = PressureAnalyzer.GetPressureInfo(_data, _config.RowCount, _config.ColCount, mode);
             }
             return _touches;
+        }
+
+        public ChessPieceInfo[] GetChessPieceInfo()
+        {
+            if (_data != null && _pieces == null)
+            {
+                _pieces = PressureAnalyzer.GetChessPieceInfo(_data, _config.RowCount, _config.ColCount);
+            }
+            return _pieces;
         }
     }
 }
