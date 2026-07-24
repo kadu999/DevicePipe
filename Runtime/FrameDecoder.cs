@@ -22,8 +22,34 @@ namespace DevicePipe
         int _lastFpsFrames;
         float _framesPerSecond;
 
+        // ── Pipeline latency tracking ──
+
+        struct TimedFrame
+        {
+            public int[] Data;
+            public long FeedTick;   // Stopwatch tick when Feed() was called
+            public long ParseTick;  // Stopwatch tick when TryDecode finished parsing
+        }
+
         /// <summary>Parsed frames waiting to be consumed by main thread.</summary>
-        readonly System.Collections.Concurrent.ConcurrentQueue<int[]> _frameQueue = new();
+        readonly System.Collections.Concurrent.ConcurrentQueue<TimedFrame> _frameQueue = new();
+
+        long _lastFeedTick;       // most recent Feed() call tick
+
+        long _lastFeedTick_us;    // most recent completed frame: Feed→Parse µs
+        long _lastQueueWait_us;   // most recent completed frame: Parse→Dequeue µs
+        long _lastDispatch_us;    // most recent completed frame: Dequeue→OnFrameDone µs (includes GPU upload)
+        long _lastTotal_us;       // most recent completed frame: Feed→OnFrameDone µs
+
+        /// <summary>Last frame pipeline latency breakdown (microseconds). (parse, queue, dispatch, total).</summary>
+        /// <remarks>
+        /// parse    = Feed → frame decoded (background thread)
+        /// queue    = frame decoded → main thread picks it up
+        /// dispatch = main thread dequeue → OnFrame callback + GPU upload completes
+        /// total    = Feed → OnFrame done (end-to-end software latency)
+        /// </remarks>
+        public (long parseUs, long queueUs, long dispatchUs, long totalUs) LastFrameLatency =>
+            (_lastFeedTick_us, _lastQueueWait_us, _lastDispatch_us, _lastTotal_us);
 
         public System.Action<int[]> OnFrame;
 
@@ -69,6 +95,7 @@ namespace DevicePipe
         public void Feed(byte[] data, int offset, int count)
         {
             if (count <= 0) return;
+            _lastFeedTick = System.Diagnostics.Stopwatch.GetTimestamp();
             _buffer.Write(data, offset, count);
             TryDecode();
         }
@@ -124,10 +151,11 @@ namespace DevicePipe
             _buffer.ReadBatch(_readBuf, 0, frameByteLen);
 
             bool checksumOk = SumCheck(_readBuf, 0, frameByteLen);
+            long parseTick = System.Diagnostics.Stopwatch.GetTimestamp();
             if (!checksumOk) { _badFrames++; DumpChecksumFail(0, frameByteLen * 2); }
             else _parsedFrames++;
 
-            CommandAnalysis(frameByteLen, checksumOk);
+            CommandAnalysis(frameByteLen, checksumOk, _lastFeedTick, parseTick);
             _buffer.Discard(frameByteLen);
         }
 
@@ -250,7 +278,7 @@ namespace DevicePipe
 
         // ── Ported from DataAnalysis.CommandAnalysis ──
 
-        void CommandAnalysis(int frameByteLen, bool checksumOk)
+        void CommandAnalysis(int frameByteLen, bool checksumOk, long feedTick, long parseTick)
         {
             int total = _config.RowCount * _config.ColCount;
             int bitsPerSample = _config.BitsPerSample;
@@ -277,7 +305,7 @@ namespace DevicePipe
 
             if (checksumOk)
             {
-                _frameQueue.Enqueue(result);
+                _frameQueue.Enqueue(new TimedFrame { Data = result, FeedTick = feedTick, ParseTick = parseTick });
             }
         }
 
@@ -292,8 +320,18 @@ namespace DevicePipe
 
         public void Update()
         {
-            while (_frameQueue.TryDequeue(out var frame))
-                OnFrame?.Invoke(frame);
+            long freq = System.Diagnostics.Stopwatch.Frequency;
+            while (_frameQueue.TryDequeue(out var tf))
+            {
+                long dequeueTick = System.Diagnostics.Stopwatch.GetTimestamp();
+                OnFrame?.Invoke(tf.Data);
+                long doneTick = System.Diagnostics.Stopwatch.GetTimestamp();
+
+                _lastFeedTick_us  = (tf.ParseTick - tf.FeedTick) * 1_000_000 / freq;
+                _lastQueueWait_us = (dequeueTick - tf.ParseTick) * 1_000_000 / freq;
+                _lastDispatch_us  = (doneTick - dequeueTick) * 1_000_000 / freq;
+                _lastTotal_us     = (doneTick - tf.FeedTick) * 1_000_000 / freq;
+            }
         }
     }
 

@@ -37,6 +37,10 @@ namespace DevicePipe
         public int QueuedFrames => _decoder?.QueuedFrameCount ?? 0;
         public int BufferedBytes => _decoder?.BufferedByteCount ?? 0;
 
+        /// <summary>Last frame pipeline latency: (parse µs, queue µs, dispatch µs, total µs).</summary>
+        public (long parseUs, long queueUs, long dispatchUs, long totalUs) LastFrameLatency =>
+            _decoder?.LastFrameLatency ?? (0, 0, 0, 0);
+
         public SerialPressureReader(int row, int col, bool useWinSerialBridge = false)
             : this(new ProtocolConfig
             {
