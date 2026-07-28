@@ -24,6 +24,11 @@ namespace DevicePipe
         int _lastFpsFrames;
         float _emaFps;
 
+        // Raw wire throughput (bytes-based, independent of parse success)
+        long _totalBytesFed;
+        long _lastBytesFed;
+        float _emaByteRate;
+
         // ── Pipeline latency tracking ──
 
         struct TimedFrame
@@ -107,8 +112,51 @@ namespace DevicePipe
         {
             if (count <= 0) return;
             _lastFeedTick = System.Diagnostics.Stopwatch.GetTimestamp();
+            _totalBytesFed += count;
             _buffer.Write(data, offset, count);
             TryDecode();
+        }
+
+        /// <summary>Total bytes ever fed to this decoder.</summary>
+        public long TotalBytesFed => _totalBytesFed;
+
+        /// <summary>Bytes-per-second throughput (EMA smoothed, from raw Feed calls).</summary>
+        public float ByteThroughput
+        {
+            get
+            {
+                long elapsed = _sw.ElapsedMilliseconds;
+                if (elapsed > 50)
+                {
+                    float instant = (_totalBytesFed - _lastBytesFed) / (elapsed / 1000f);
+                    float alpha = 0.2f;
+                    if (_emaByteRate <= 0) _emaByteRate = instant;
+                    else _emaByteRate += (instant - _emaByteRate) * alpha;
+                }
+                if (elapsed >= 1000)
+                {
+                    _lastBytesFed = _totalBytesFed;
+                    // NOTE: don't restart _sw — FramesPerSecond shares it, restart there
+                }
+                return _emaByteRate;
+            }
+        }
+
+        /// <summary>
+        /// Estimated frame rate from wire throughput = ByteThroughput / bytesPerFrame.
+        /// Independent of parse success — measures what the hardware is sending.
+        /// </summary>
+        public float WireFrameRate
+        {
+            get
+            {
+                float bps = ByteThroughput;
+                if (bps <= 0) return 0;
+                int bytesPerFrame = _config.HeadLen
+                    + _config.RowCount * _config.ColCount * (_config.BitsPerSample / 8)
+                    + ChecksumLen();
+                return bytesPerFrame > 0 ? bps / bytesPerFrame : 0;
+            }
         }
 
         public void Reset()
