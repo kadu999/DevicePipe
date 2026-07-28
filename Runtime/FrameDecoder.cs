@@ -25,6 +25,7 @@ namespace DevicePipe
         float _emaFps;
 
         // Raw wire throughput (bytes-based, independent of parse success)
+        readonly System.Diagnostics.Stopwatch _byteSw = System.Diagnostics.Stopwatch.StartNew();
         long _totalBytesFed;
         long _lastBytesFed;
         float _emaByteRate;
@@ -125,18 +126,20 @@ namespace DevicePipe
         {
             get
             {
-                long elapsed = _sw.ElapsedMilliseconds;
-                if (elapsed > 50)
+                long elapsed = _byteSw.ElapsedMilliseconds;
+                if (_byteSw.Elapsed.TotalSeconds > 2 && _emaByteRate <= 0)
+                {
+                    // initial seed from cumulative average
+                    _emaByteRate = _totalBytesFed / (float)_byteSw.Elapsed.TotalSeconds;
+                }
+                if (elapsed >= 200)
                 {
                     float instant = (_totalBytesFed - _lastBytesFed) / (elapsed / 1000f);
-                    float alpha = 0.2f;
+                    float alpha = 0.3f;
                     if (_emaByteRate <= 0) _emaByteRate = instant;
                     else _emaByteRate += (instant - _emaByteRate) * alpha;
-                }
-                if (elapsed >= 1000)
-                {
                     _lastBytesFed = _totalBytesFed;
-                    // NOTE: don't restart _sw — FramesPerSecond shares it, restart there
+                    _byteSw.Restart();
                 }
                 return _emaByteRate;
             }
