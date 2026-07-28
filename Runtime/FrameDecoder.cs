@@ -7,7 +7,8 @@ using UnityEngine;
 namespace DevicePipe
 {
     /// <summary>
-    /// Parses a byte stream into protocol frames. Ported from UnityViewer DataAnalysis.cs.
+    /// Parses a byte stream into protocol frames.
+    /// Multi-frame batch decode — one Feed() call processes ALL complete frames in the buffer.
     /// </summary>
     public class FrameDecoder
     {
@@ -16,6 +17,7 @@ namespace DevicePipe
 
         int _parsedFrames;
         int _badFrames;
+        int _droppedFrames; // frames evicted from queue (main thread too slow)
 
         // FPS measurement
         readonly System.Diagnostics.Stopwatch _sw = System.Diagnostics.Stopwatch.StartNew();
@@ -34,20 +36,16 @@ namespace DevicePipe
         /// <summary>Parsed frames waiting to be consumed by main thread.</summary>
         readonly System.Collections.Concurrent.ConcurrentQueue<TimedFrame> _frameQueue = new();
 
-        long _lastFeedTick;       // most recent Feed() call tick
+        /// <summary>Max queued frames before oldest is evicted (backpressure).</summary>
+        const int MaxQueueSize = 4;
 
-        long _lastFeedTick_us;    // most recent completed frame: Feed→Parse µs
-        long _lastQueueWait_us;   // most recent completed frame: Parse→Dequeue µs
-        long _lastDispatch_us;    // most recent completed frame: Dequeue→OnFrameDone µs (includes GPU upload)
-        long _lastTotal_us;       // most recent completed frame: Feed→OnFrameDone µs
+        long _lastFeedTick;
+        long _lastFeedTick_us;
+        long _lastQueueWait_us;
+        long _lastDispatch_us;
+        long _lastTotal_us;
 
         /// <summary>Last frame pipeline latency breakdown (microseconds). (parse, queue, dispatch, total).</summary>
-        /// <remarks>
-        /// parse    = Feed → frame decoded (background thread)
-        /// queue    = frame decoded → main thread picks it up
-        /// dispatch = main thread dequeue → OnFrame callback + GPU upload completes
-        /// total    = Feed → OnFrame done (end-to-end software latency)
-        /// </remarks>
         public (long parseUs, long queueUs, long dispatchUs, long totalUs) LastFrameLatency =>
             (_lastFeedTick_us, _lastQueueWait_us, _lastDispatch_us, _lastTotal_us);
 
@@ -55,6 +53,10 @@ namespace DevicePipe
 
         public int ParsedFrameCount => _parsedFrames;
         public int BadFrameCount => _badFrames;
+
+        /// <summary>Frames evicted from the output queue (main thread not keeping up).</summary>
+        public int DroppedFrameCount => _droppedFrames;
+
         public int BufferedByteCount => _buffer.Count;
         public int QueuedFrameCount => _frameQueue.Count;
 
@@ -81,6 +83,8 @@ namespace DevicePipe
         {
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _buffer = new RingBuffer(230400);
+            _buffer.OnOverflow += () => OnError?.Invoke(
+                $"[RingBuffer] 溢出! 容量={_buffer.Capacity} 溢出次数={_buffer.OverflowCount} 丢弃字节={_buffer.OverflowBytes}");
             FrameDecoderRunner.Add(this);
         }
 
@@ -105,59 +109,152 @@ namespace DevicePipe
             _buffer.Clear();
             _parsedFrames = 0;
             _badFrames = 0;
+            _droppedFrames = 0;
         }
 
-        // ── Scratch buffer for frame operations ──
-        // Sized for a full 100x100@16bit frame: ~20KB + head + checksum
+        // ── Scratch buffers ──
+        // _readBuf: sized for a full 100×100@16bit frame ~20KB + head + checksum
         byte[] _readBuf = new byte[23040];
-        // Smaller buffer for header scanning — 4KB on stack avoids heap alloc
+        // _scanBuf: smaller buffer for header scanning — avoids per-byte lock calls
         byte[] _scanBuf = new byte[4096];
 
+        // ── Frame format constants (A55A01 protocol) ──
+        // Byte layout: [A5][5A][01] [len_lo][len_hi] [gap] [data...] [checksum...]
+        // header=3, length_field=2, gap=1 → HeadLen=6
+        const int HEADER_A5 = 0;
+        const int HEADER_5A = 1;
+        const int HEADER_01 = 2;
+        const int LEN_LO    = 3;
+        const int LEN_HI    = 4;
+
+        /// <summary>
+        /// Decode ALL complete frames currently in the ring buffer.
+        /// Loops until no more full frames are available, minimizing per-frame lock overhead.
+        /// </summary>
         void TryDecode()
         {
-            // Row*Col threshold (single Count access — cheap, one lock)
-            if (_buffer.Count < _config.RowCount * _config.ColCount) return;
+            int checksumLen = ChecksumLen();
+            int minDataBytes = _config.RowCount * _config.ColCount * (_config.BitsPerSample / 8);
+            int minTotalBytes = _config.HeadLen + minDataBytes + checksumLen;
 
-            // Find header by scanning a batched copy (single lock) instead of
-            // per-byte indexer calls (each with its own lock).
-            int searchLen = Math.Min(_buffer.Count, _scanBuf.Length);
-            _buffer.ReadBatch(_scanBuf, 0, searchLen);
-            int headBytePos = FindHeaderInBuffer(_scanBuf, searchLen);
-            if (headBytePos < 0)
+            while (_buffer.Count >= minTotalBytes)
             {
-                if (_buffer.Count > _readBuf.Length / 2)
-                    _buffer.Discard(_buffer.Count / 4);
+                // ── Phase 1: Peek header region ──
+                int peekLen = Math.Min(_buffer.Count, _scanBuf.Length);
+                _buffer.ReadBatch(_scanBuf, 0, peekLen);
+
+                // ── Phase 2: Find A5 5A 01 header ──
+                int headerPos = -1;
+                int scanEnd = peekLen - 2;
+                for (int i = 0; i < scanEnd; i++)
+                {
+                    if (_scanBuf[i] == 0xA5 && _scanBuf[i + 1] == 0x5A && _scanBuf[i + 2] == 0x01)
+                    {
+                        headerPos = i;
+                        break;
+                    }
+                }
+
+                if (headerPos < 0)
+                {
+                    // No header found in scanned region.
+                    // Safely discard all but the last 2 bytes (could be partial A5 5A).
+                    int discard = Math.Max(peekLen - 2, 1);
+                    _buffer.Discard(discard);
+                    continue;
+                }
+
+                // Header found — discard garbage before it
+                if (headerPos > 0)
+                {
+                    _buffer.Discard(headerPos);
+                    continue;
+                }
+
+                // ── Phase 3: Header at position 0 — parse frame length ──
+                // _scanBuf[0..4] is valid (we confirmed peekLen >= 5 via minTotalBytes)
+                int rawLen = _scanBuf[LEN_LO] + _scanBuf[LEN_HI] * 256;
+                int dataBytes = rawLen - _config.HeadLen;
+                if (dataBytes <= 0)
+                {
+                    _buffer.Discard(1); // bogus frame, skip one byte and re-scan
+                    continue;
+                }
+
+                int frameByteLen = _config.HeadLen + dataBytes + checksumLen;
+                if (frameByteLen <= 0 || frameByteLen > _readBuf.Length)
+                {
+                    _buffer.Discard(1);
+                    continue;
+                }
+
+                if (_buffer.Count < frameByteLen)
+                    return; // Incomplete frame — wait for more data
+
+                // ── Phase 4: Read entire frame in one batch ──
+                _buffer.ReadBatch(_readBuf, 0, frameByteLen);
+
+                // ── Phase 5: Checksum + extract ──
+                ProcessFrame(frameByteLen);
+
+                // ── Phase 6: Discard consumed frame, loop for next ──
+                _buffer.Discard(frameByteLen);
+            }
+        }
+
+        /// <summary>Process one complete frame sitting in _readBuf[0..frameByteLen-1].</summary>
+        void ProcessFrame(int frameByteLen)
+        {
+            bool checksumOk = _config.SkipChecksum || SumCheck(_readBuf, 0, frameByteLen);
+            long parseTick = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            if (!checksumOk)
+            {
+                _badFrames++;
+                if (_badFrames <= 5)
+                    DumpChecksumFail(frameByteLen);
                 return;
             }
-            if (headBytePos > 0) { _buffer.Discard(headBytePos); return; }
 
-            // Verify header bytes (re-read after discard — head is now at position 0)
-            if (_buffer.Count < 3) return;
-            _buffer.ReadBatch(_scanBuf, 0, 3);
-            if (_scanBuf[0] != 0xA5 || _scanBuf[1] != 0x5A || _scanBuf[2] != 0x01) { _buffer.Discard(1); return; }
+            _parsedFrames++;
 
-            // Read length field (bytes 3-4, little-endian)
-            if (_buffer.Count < 5) return;
-            _buffer.ReadBatch(_scanBuf, 0, 5);
-            int rawLen = _scanBuf[3] + _scanBuf[4] * 256;
-            int dataBytes = rawLen - _config.HeadLen;
-            if (dataBytes <= 0) { _buffer.Discard(1); return; }
+            int total = _config.RowCount * _config.ColCount;
+            int bitsPerSample = _config.BitsPerSample;
+            int dataStart = _config.HeadLen;
+            int[] result = new int[total];
 
-            // Full frame = head(3) + len(2) + gap(1) + data + checksum
-            int frameByteLen = _config.HeadLen + dataBytes + ChecksumLen();
-            if (_buffer.Count < frameByteLen) return;
+            if (bitsPerSample == 8)
+            {
+                for (int i = 0; i < total; i++)
+                    result[i] = _readBuf[dataStart + i];
+            }
+            else // 16-bit: scale 12-bit ADC (0-4095) → 8-bit (0-255), integer math
+            {
+                for (int i = 0; i < total; i++)
+                {
+                    int off = dataStart + i * 2;
+                    // val ∈ [0, 4095]; val * 255 / 4096 fits in int, no float overhead
+                    result[i] = ((_readBuf[off] + _readBuf[off + 1] * 256) * 255) / 4096;
+                }
+            }
 
-            // Batch-copy the entire frame in one lock
-            _buffer.ReadBatch(_readBuf, 0, frameByteLen);
+            // ── Enqueue with backpressure ──
+            // If main thread can't keep up, drop oldest frames rather than grow unbounded.
+            while (_frameQueue.Count >= MaxQueueSize)
+            {
+                _frameQueue.TryDequeue(out _);
+                _droppedFrames++;
+            }
 
-            bool checksumOk = SumCheck(_readBuf, 0, frameByteLen);
-            long parseTick = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (!checksumOk) { _badFrames++; DumpChecksumFail(0, frameByteLen * 2); }
-            else _parsedFrames++;
-
-            CommandAnalysis(frameByteLen, checksumOk, _lastFeedTick, parseTick);
-            _buffer.Discard(frameByteLen);
+            _frameQueue.Enqueue(new TimedFrame
+            {
+                Data = result,
+                FeedTick = _lastFeedTick,
+                ParseTick = parseTick
+            });
         }
+
+        // ── Header scan helper ──
 
         int FindHeaderInBuffer(byte[] buf, int len)
         {
@@ -167,7 +264,10 @@ namespace DevicePipe
             return -1;
         }
 
-        // ── CRC32 Mpeg2 lookup table (precomputed once, O(1)/byte) ──
+        // ══════════════════════════════════════════════════════════
+        //  Checksum implementations (lookup-table based, O(1)/byte)
+        // ══════════════════════════════════════════════════════════
+
         static readonly uint[] _crc32Table = BuildCrc32Table();
 
         static uint[] BuildCrc32Table()
@@ -183,7 +283,6 @@ namespace DevicePipe
             return table;
         }
 
-        // ── CRC16 Modbus lookup table (precomputed once, O(1)/byte) ──
         static readonly ushort[] _crc16Table = BuildCrc16Table();
 
         static ushort[] BuildCrc16Table()
@@ -198,8 +297,6 @@ namespace DevicePipe
             }
             return table;
         }
-
-        // ── Ported from DataAnalysis.SumCheck ──
 
         bool SumCheck(byte[] cmd, int start, int len)
         {
@@ -251,64 +348,6 @@ namespace DevicePipe
                 && cmd[start + len - 1] == crc0;
         }
 
-        void DumpChecksumFail(int headIndex, int len)
-        {
-            if (_badFrames > 5) return;
-            int s = headIndex / 2;
-            int l = len / 2;
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine($"校验失败 #{_badFrames}: chk={_config.Checksum} bits={_config.BitsPerSample} len={l}");
-
-            if (_config.Checksum == ChecksumType.CRC16_Modbus)
-            {
-                ushort crc = 0xFFFF;
-                for (int i = s; i < l + s - 2; i++)
-                    crc = (ushort)((crc >> 8) ^ _crc16Table[(crc ^ _readBuf[i]) & 0xFF]);
-                sb.AppendLine($"  Computed: {crc:X4}  Expected: {_readBuf[s + l - 2]:X2}{_readBuf[s + l - 1]:X2}");
-            }
-            else if (_config.Checksum == ChecksumType.Sum16)
-            {
-                short t = 0; for (int i = s; i < l + s - 2; i++) t += (short)_readBuf[i];
-                sb.AppendLine($"  Computed: {(byte)(t & 0xFF):X2}{(byte)(t >> 8):X2}  Expected: {_readBuf[s + l - 2]:X2}{_readBuf[s + l - 1]:X2}");
-            }
-
-            sb.Append("  Hex: ").AppendLine(BitConverter.ToString(_readBuf, s, Math.Min(l, 64)).Replace("-", " "));
-            OnError?.Invoke(sb.ToString());
-        }
-
-        // ── Ported from DataAnalysis.CommandAnalysis ──
-
-        void CommandAnalysis(int frameByteLen, bool checksumOk, long feedTick, long parseTick)
-        {
-            int total = _config.RowCount * _config.ColCount;
-            int bitsPerSample = _config.BitsPerSample;
-            int dataBytes = total * (bitsPerSample / 8);
-
-            if (frameByteLen < _config.HeadLen + dataBytes + ChecksumLen()) return;
-
-            int[] result = new int[total];
-            int dataStart = _config.HeadLen;
-
-            if (bitsPerSample == 8)
-            {
-                for (int i = 0; i < total; i++)
-                    result[i] = _readBuf[dataStart + i];
-            }
-            else
-            {
-                for (int i = 0; i < total; i++)
-                {
-                    int off = dataStart + i * 2;
-                    result[i] = (int)((_readBuf[off] + _readBuf[off + 1] * 256) / 4096f * 255f);
-                }
-            }
-
-            if (checksumOk)
-            {
-                _frameQueue.Enqueue(new TimedFrame { Data = result, FeedTick = feedTick, ParseTick = parseTick });
-            }
-        }
-
         int ChecksumLen()
         {
             return _config.Checksum switch
@@ -317,6 +356,34 @@ namespace DevicePipe
                 _ => 2
             };
         }
+
+        // ── Diagnostics ──
+
+        void DumpChecksumFail(int frameByteLen)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"校验失败 #{_badFrames}: chk={_config.Checksum} bits={_config.BitsPerSample} len={frameByteLen}");
+
+            if (_config.Checksum == ChecksumType.CRC16_Modbus)
+            {
+                ushort crc = 0xFFFF;
+                for (int i = 0; i < frameByteLen - 2; i++)
+                    crc = (ushort)((crc >> 8) ^ _crc16Table[(crc ^ _readBuf[i]) & 0xFF]);
+                sb.AppendLine($"  Computed: {crc:X4}  Expected: {_readBuf[frameByteLen - 2]:X2}{_readBuf[frameByteLen - 1]:X2}");
+            }
+            else if (_config.Checksum == ChecksumType.Sum16)
+            {
+                short t = 0; for (int i = 0; i < frameByteLen - 2; i++) t += (short)_readBuf[i];
+                sb.AppendLine($"  Computed: {(byte)(t & 0xFF):X2}{(byte)(t >> 8):X2}  Expected: {_readBuf[frameByteLen - 2]:X2}{_readBuf[frameByteLen - 1]:X2}");
+            }
+
+            sb.Append("  Hex: ").AppendLine(BitConverter.ToString(_readBuf, 0, Math.Min(frameByteLen, 64)).Replace("-", " "));
+            OnError?.Invoke(sb.ToString());
+        }
+
+        // ══════════════════════════════════════════════════════════
+        //  Main-thread dispatch
+        // ══════════════════════════════════════════════════════════
 
         public void Update()
         {
@@ -354,23 +421,13 @@ namespace DevicePipe
 
         private List<FrameDecoder> _list = new List<FrameDecoder>();
 
-
         private void Update()
         {
             foreach (var node in _list)
-            {
                 node.Update();
-            }
         }
 
-        public static void Add(FrameDecoder decoder)
-        {
-            Instance._list.Add(decoder);
-        }
-
-        public static void Remove(FrameDecoder decoder)
-        {
-            Instance._list.Remove(decoder);
-        }
+        public static void Add(FrameDecoder decoder) { Instance._list.Add(decoder); }
+        public static void Remove(FrameDecoder decoder) { Instance._list.Remove(decoder); }
     }
 }

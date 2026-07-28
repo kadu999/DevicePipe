@@ -34,6 +34,7 @@ namespace DevicePipe
         public float FrameRate => _decoder?.FramesPerSecond ?? 0f;
         public int FrameCount => _decoder?.ParsedFrameCount ?? 0;
         public int BadFrameCount => _decoder?.BadFrameCount ?? 0;
+        public int DroppedFrameCount => _decoder?.DroppedFrameCount ?? 0;
         public int QueuedFrames => _decoder?.QueuedFrameCount ?? 0;
         public int BufferedBytes => _decoder?.BufferedByteCount ?? 0;
 

@@ -2,7 +2,7 @@ using System;
 
 namespace DevicePipe
 {
-    /// <summary>Thread-safe circular byte buffer.</summary>
+    /// <summary>Thread-safe circular byte buffer with overflow detection.</summary>
     public class RingBuffer
     {
         readonly byte[] _buf;
@@ -17,12 +17,43 @@ namespace DevicePipe
         public int Capacity => _buf.Length;
         public int Free => _buf.Length - Count;
 
+        /// <summary>Total bytes discarded due to buffer full.</summary>
+        public long OverflowBytes { get; private set; }
+
+        /// <summary>Number of overflow events (buffer full → data rejected).</summary>
+        public int OverflowCount { get; private set; }
+
+        /// <summary>Fired when data is rejected because buffer is full.</summary>
+        public event Action OnOverflow;
+
         public void Write(byte[] src, int offset, int count)
         {
             if (count <= 0) return;
             lock (_lock)
             {
-                if (Free < count) return; // overflow, discard
+                if (Free < count)
+                {
+                    // ── Overflow: buffer can't keep up with incoming data ──
+                    // Aggressively clear the buffer to re-sync with the stream.
+                    // Partial data is worse than no data — stale bytes cause
+                    // cascading checksum failures until a header realigns.
+                    OverflowCount++;
+                    OverflowBytes += count;
+                    _start = _end = _count = 0;
+                    OnOverflow?.Invoke();
+
+                    // Now write the new data into the clean buffer
+                    if (count > _buf.Length)
+                    {
+                        // Single write exceeds total capacity — truncate from the end
+                        offset += count - _buf.Length;
+                        count = _buf.Length;
+                    }
+                    Array.Copy(src, offset, _buf, 0, count);
+                    _end = count;
+                    _count = count;
+                    return;
+                }
 
                 int first = Math.Min(count, _buf.Length - _end);
                 Array.Copy(src, offset, _buf, _end, first);
@@ -70,7 +101,7 @@ namespace DevicePipe
 
         /// <summary>
         /// Batch-read bytes into a destination buffer WITHOUT modifying the read head.
-        /// Useful for frame scanning / header detection — avoids per-byte lock overhead.
+        /// Single lock — efficient for frame scanning and header detection.
         /// Returns actual number of bytes copied.
         /// </summary>
         public int ReadBatch(byte[] dst, int dstOffset, int count)
