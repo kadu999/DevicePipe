@@ -19,10 +19,10 @@ namespace DevicePipe
         int _badFrames;
         int _droppedFrames; // frames evicted from queue (main thread too slow)
 
-        // FPS measurement
+        // FPS measurement (EMA updated continuously)
         readonly System.Diagnostics.Stopwatch _sw = System.Diagnostics.Stopwatch.StartNew();
         int _lastFpsFrames;
-        float _framesPerSecond;
+        float _emaFps;
 
         // ── Pipeline latency tracking ──
 
@@ -60,20 +60,27 @@ namespace DevicePipe
         public int BufferedByteCount => _buffer.Count;
         public int QueuedFrameCount => _frameQueue.Count;
 
-        /// <summary>Estimated frames per second, updated every second.</summary>
+        /// <summary>Estimated frames per second (EMA smoothed, updates continuously).</summary>
         public float FramesPerSecond
         {
             get
             {
                 long elapsed = _sw.ElapsedMilliseconds;
+                if (elapsed > 50) // don't update too aggressively, avoid jitter
+                {
+                    float instant = (_parsedFrames - _lastFpsFrames) / (elapsed / 1000f);
+                    float alpha = 0.2f; // EMA smoothing — fast response, low noise
+                    if (_emaFps <= 0) _emaFps = instant;
+                    else _emaFps += (instant - _emaFps) * alpha;
+                }
+
                 if (elapsed >= 1000)
                 {
-                    float delta = elapsed / 1000f;
-                    _framesPerSecond = (_parsedFrames - _lastFpsFrames) / delta;
                     _lastFpsFrames = _parsedFrames;
                     _sw.Restart();
                 }
-                return _framesPerSecond;
+
+                return _emaFps;
             }
         }
 
