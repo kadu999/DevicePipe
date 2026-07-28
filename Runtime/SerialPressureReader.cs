@@ -5,31 +5,21 @@ namespace DevicePipe
 {
     /// <summary>
     /// Wraps serial bridge + frame decoder into one managed pipeline.
-    /// Auto-connects to the last available COM port on Open().
+    /// Auto-connects to the last available port on Open().
     /// </summary>
     public class SerialPressureReader
     {
         public event System.Action<int[], int, int> OnFrame;
 
         readonly ProtocolConfig _config;
-        readonly bool _useWin;
-
-        DeviceLink.WinSerialBridge _winSerial;
-        DeviceLink.SerialPortBridge _serial;
+        SerialBridge _bridge;
         FrameDecoder _decoder;
 
         int[] _data;
         PressureInfo[] _touches;
         ChessPieceInfo[] _pieces;
 
-        public bool IsOpen
-        {
-            get
-            {
-                if (_useWin) return _winSerial != null && _winSerial.IsOpen;
-                return _serial != null && _serial.IsOpen;
-            }
-        }
+        public bool IsOpen => _bridge != null && _bridge.IsOpen;
 
         public float FrameRate => _decoder?.FramesPerSecond ?? 0f;
         public float WireFrameRate => _decoder?.WireFrameRate ?? 0f;
@@ -43,7 +33,7 @@ namespace DevicePipe
         public (long parseUs, long queueUs, long dispatchUs, long totalUs) LastFrameLatency =>
             _decoder?.LastFrameLatency ?? (0, 0, 0, 0);
 
-        public SerialPressureReader(int row, int col, bool useWinSerialBridge = false)
+        public SerialPressureReader(int row, int col)
             : this(new ProtocolConfig
             {
                 HeaderHex = "A55A01",
@@ -53,16 +43,15 @@ namespace DevicePipe
                 RowCount = row,
                 ColCount = col,
                 SkipChecksum = true,
-            }, useWinSerialBridge) { }
+            }) { }
 
-        public SerialPressureReader(ProtocolConfig config, bool useWinSerialBridge = false)
+        public SerialPressureReader(ProtocolConfig config)
         {
             _config = config;
-            _useWin = useWinSerialBridge;
         }
 
         /// <summary>
-        /// Open the specified port, or auto-detect the last available COM port if null/empty.
+        /// Open the specified port, or auto-detect the last available port if null/empty.
         /// </summary>
         public void Open(string portName = null, int baudRate = 460800)
         {
@@ -71,21 +60,12 @@ namespace DevicePipe
             _decoder = new FrameDecoder(_config);
             _decoder.OnFrame += UpdateData;
 
-            if (_useWin)
-            {
-                _winSerial = new DeviceLink.WinSerialBridge();
-                _winSerial.OnDataReceived += (buf, off, len) => _decoder?.Feed(buf, off, len);
-                var port = ResolvePort(portName, DeviceLink.WinSerialBridge.GetPortNames());
-                if (!string.IsNullOrEmpty(port)) _winSerial.Open(port, baudRate);
-            }
-            else
-            {
-                _serial = new DeviceLink.SerialPortBridge();
-                _serial.OnDataReceived += (buf, off, len) => _decoder?.Feed(buf, off, len);
-                _serial.OnError += e => Debug.LogWarning($"[Serial] {e}");
-                var port = ResolvePort(portName, DeviceLink.SerialPortBridge.GetPortNames());
-                if (!string.IsNullOrEmpty(port)) _serial.Open(port, baudRate);
-            }
+            _bridge = new SerialBridge();
+            _bridge.OnDataReceived += (buf, off, len) => _decoder?.Feed(buf, off, len);
+            _bridge.OnError += e => Debug.LogWarning($"[Serial] {e}");
+
+            var port = ResolvePort(portName, SerialBridge.GetPortNames());
+            if (!string.IsNullOrEmpty(port)) _bridge.Open(port, baudRate);
         }
 
         static string ResolvePort(string requested, string[] available)
@@ -96,12 +76,10 @@ namespace DevicePipe
 
         public void Close()
         {
-            _winSerial?.Close();
-            _serial?.Close();
+            _bridge?.Close();
             _decoder?.Dispose();
             _decoder = null;
-            _winSerial = null;
-            _serial = null;
+            _bridge = null;
         }
 
         private void UpdateData(int[] data)
