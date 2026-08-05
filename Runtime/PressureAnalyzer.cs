@@ -70,6 +70,8 @@ namespace DevicePipe
         public static PressureInfo[] GetPressureInfo(int[] data, int width, int height,
                                                       RadiusMode mode = RadiusMode.Direction)
         {
+            (width, height) = (height, width);
+
             EnsureKernel();
             Resize(width, height);
 
@@ -487,6 +489,8 @@ namespace DevicePipe
         /// <summary>Detect ring-shaped contacts (chess pieces) from pressure frame.</summary>
         public static ChessPieceInfo[] GetChessPieceInfo(int[] data, int width, int height)
         {
+            (width, height) = (height, width);
+
             if (data == null || width <= 0 || height <= 0)
                 return System.Array.Empty<ChessPieceInfo>();
 

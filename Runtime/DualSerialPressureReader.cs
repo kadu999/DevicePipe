@@ -150,14 +150,15 @@ namespace DevicePipe
             int[] right = _swapped ? dataA : dataB;
 
             // Row-major interleave: each output row = left_row + right_row.
-            int outW = _col * 2;
-            for (int r = 0, s = 0, d = 0; r < _row; r++, s += _col, d += outW)
+            int outH = _col * 2;
+            int outW = _row;
+            for (int r = 0, s = 0, d = 0; r < outW; r++, s += _col, d += outH)
             {
                 System.Array.Copy(left,  s, _merged, d,          _col);
                 System.Array.Copy(right, s, _merged, d + _col,   _col);
             }
 
-            OnFrame?.Invoke(_merged, outW, _row);
+            OnFrame?.Invoke(_merged, outW, outH); // width, height
         }
     }
 }
