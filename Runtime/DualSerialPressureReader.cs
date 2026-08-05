@@ -23,9 +23,8 @@ namespace DevicePipe
         int[] _dataA;
         int[] _dataB;
         int[] _merged;
-        int[] _zeros;
-        int _staleA, _staleB; // 帧数过期计数, 超过 MaxStale 视为残留
-        const int MaxStale = 2;
+        int[] _zeros; // 单板模式或未就绪侧全零填充
+        int _frameCountA, _frameCountB;
 
         int[] Zeros => _zeros ?? (_zeros = new int[_cellCount]);
 
@@ -139,20 +138,22 @@ namespace DevicePipe
 
         void OnFrameA(int[] data, int w, int h)
         {
+            if (++_frameCountA == 1)
+                Debug.Log($"[DualReader] A 首帧到达  len={data.Length}  cellCount={_cellCount}  readerB={_readerB != null}");
+
             _dataA = data;
-            _staleA = 0;
-            int[] right = (_readerB != null && _dataB != null && _staleB < MaxStale) ? _dataB : Zeros;
+            int[] right = _readerB != null ? (_dataB ?? Zeros) : Zeros;
             Merge(_dataA, right);
-            _staleA++; _staleB++;
         }
 
         void OnFrameB(int[] data, int w, int h)
         {
+            if (++_frameCountB == 1)
+                Debug.Log($"[DualReader] B 首帧到达  len={data.Length}  cellCount={_cellCount}  readerA={_readerA != null}");
+
             _dataB = data;
-            _staleB = 0;
-            int[] left = (_readerA != null && _dataA != null && _staleA < MaxStale) ? _dataA : Zeros;
+            int[] left = _readerA != null ? (_dataA ?? Zeros) : Zeros;
             Merge(left, _dataB);
-            _staleA++; _staleB++;
         }
 
         void Merge(int[] dataA, int[] dataB)
