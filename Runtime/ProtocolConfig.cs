@@ -28,6 +28,9 @@ namespace DevicePipe
         /// <summary>Checksum method</summary>
         public ChecksumType Checksum = ChecksumType.Sum16;
 
+        /// <summary>Set true to auto-detect BitsPerSample from the first received frame.</summary>
+        public bool AutoDetectBitsPerSample = false;
+
         /// <summary>Data grid row count</summary>
         public int RowCount = 1;
 

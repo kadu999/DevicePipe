@@ -3,10 +3,6 @@ using UnityEngine;
 
 namespace DevicePipe
 {
-    /// <summary>
-    /// Wraps serial bridge + frame decoder into one managed pipeline.
-    /// Auto-connects to the last available port on Open().
-    /// </summary>
     public class SerialPressureReader
     {
         public event System.Action<int[], int, int> OnFrame;
@@ -14,6 +10,7 @@ namespace DevicePipe
         readonly ProtocolConfig _config;
         SerialBridge _bridge;
         FrameDecoder _decoder;
+        BitsPerSampleDetector _detector;
 
         int[] _data;
         PressureInfo[] _touches;
@@ -29,7 +26,6 @@ namespace DevicePipe
         public int QueuedFrames => _decoder?.QueuedFrameCount ?? 0;
         public int BufferedBytes => _decoder?.BufferedByteCount ?? 0;
 
-        /// <summary>Last frame pipeline latency: (parse µs, queue µs, dispatch µs, total µs).</summary>
         public (long parseUs, long queueUs, long dispatchUs, long totalUs) LastFrameLatency =>
             _decoder?.LastFrameLatency ?? (0, 0, 0, 0);
 
@@ -50,22 +46,44 @@ namespace DevicePipe
             _config = config;
         }
 
-        /// <summary>
-        /// Open the specified port, or auto-detect the last available port if null/empty.
-        /// </summary>
         public void Open(string portName = null, int baudRate = 460800)
         {
-            if (_decoder != null) return; // already opened
+            if (_decoder != null) return;
+
+            _bridge = new SerialBridge();
+            _bridge.OnError += e => Debug.LogWarning($"[Serial] {e}");
+            _bridge.OnDataReceived += OnDetectData;
 
             _decoder = new FrameDecoder(_config);
             _decoder.OnFrame += UpdateData;
 
-            _bridge = new SerialBridge();
-            _bridge.OnDataReceived += (buf, off, len) => _decoder?.Feed(buf, off, len);
-            _bridge.OnError += e => Debug.LogWarning($"[Serial] {e}");
+            if (_config.AutoDetectBitsPerSample)
+            {
+                int samples = _config.RowCount * _config.ColCount;
+                _detector = new BitsPerSampleDetector(_config.HeaderBytes, _config.HeaderByteLength, samples);
+            }
 
             var port = ResolvePort(portName, SerialBridge.GetPortNames());
             if (!string.IsNullOrEmpty(port)) _bridge.Open(port, baudRate);
+        }
+
+        void OnDetectData(byte[] data, int offset, int count)
+        {
+            if (_detector != null)
+            {
+                _detector.Feed(data, offset, count);
+
+                if (_detector.DetectedBits > 0)
+                {
+                    _config.BitsPerSample = _detector.DetectedBits;
+                    Debug.Log($"[SerialPressureReader] auto-detected {_detector.DetectedBits}-bit");
+                    _detector = null;
+                }
+            }
+            else
+            {
+                _decoder?.Feed(data, offset, count);
+            }
         }
 
         static string ResolvePort(string requested, string[] available)

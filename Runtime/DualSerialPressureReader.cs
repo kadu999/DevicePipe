@@ -14,6 +14,7 @@ namespace DevicePipe
         public event System.Action<int[], int, int> OnFrame;
 
         readonly int _row, _col;
+        readonly ProtocolConfig _config;
         int _cellCount;
 
         SerialPressureReader _readerA;
@@ -60,6 +61,14 @@ namespace DevicePipe
             _cellCount = row * col;
         }
 
+        public DualSerialPressureReader(ProtocolConfig config)
+        {
+            _row = config.RowCount;
+            _col = config.ColCount;
+            _cellCount = _row * _col;
+            _config = config;
+        }
+
         /// <summary>
         /// Open both ports. If a port string is null or empty, auto-detect from
         /// available serial ports. When both are empty, assigns the last two
@@ -82,14 +91,14 @@ namespace DevicePipe
 
             if (!string.IsNullOrEmpty(resolvedA))
             {
-                _readerA = new SerialPressureReader(_row, _col);
+                _readerA = _config != null ? new SerialPressureReader(_config) : new SerialPressureReader(_row, _col);
                 _readerA.OnFrame += OnFrameA;
                 _readerA.Open(resolvedA, baudRate);
             }
 
             if (!string.IsNullOrEmpty(resolvedB))
             {
-                _readerB = new SerialPressureReader(_row, _col);
+                _readerB = _config != null ? new SerialPressureReader(_config) : new SerialPressureReader(_row, _col);
                 _readerB.OnFrame += OnFrameB;
                 _readerB.Open(resolvedB, baudRate);
             }
