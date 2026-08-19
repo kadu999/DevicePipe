@@ -133,10 +133,10 @@ namespace DevicePipe
 
         public void Swap() => _swapped = !_swapped;
 
-        public PressureInfo[] GetPressureInfo(RadiusMode mode = RadiusMode.Direction)
+        public PressureInfo[] GetPressureInfo(RadiusMode mode = RadiusMode.Direction, bool enableFilter = false)
         {
             if (_merged == null) return System.Array.Empty<PressureInfo>();
-            return PressureAnalyzer.GetPressureInfo(_merged, _row, _col * 2, mode);
+            return PressureAnalyzer.GetPressureInfo(_merged, _row, _col * 2, mode, enableFilter);
         }
 
         public ChessPieceInfo[] GetChessPieceInfo()

@@ -108,11 +108,11 @@ namespace DevicePipe
             OnFrame?.Invoke(data, _config.RowCount, _config.ColCount);
         }
 
-        public PressureInfo[] GetPressureInfo(RadiusMode mode = RadiusMode.Direction)
+        public PressureInfo[] GetPressureInfo(RadiusMode mode = RadiusMode.Direction, bool enableFilter = false)
         {
             if (_data != null && _touches == null)
             {
-                _touches = PressureAnalyzer.GetPressureInfo(_data, _config.RowCount, _config.ColCount, mode);
+                _touches = PressureAnalyzer.GetPressureInfo(_data, _config.RowCount, _config.ColCount, mode, enableFilter);
             }
             return _touches;
         }
