@@ -14,7 +14,8 @@ namespace DevicePipe
 
         int[] _data;
         PressureInfo[] _touches;
-        ChessPieceInfo[] _pieces;
+        PieceInfo[] _solidPieces;
+        readonly PieceTracker _pieceTracker = new PieceTracker();
 
         public bool IsOpen => _bridge != null && _bridge.IsOpen;
 
@@ -104,7 +105,7 @@ namespace DevicePipe
         {
             _data = data;
             _touches = null;
-            _pieces = null;
+            _solidPieces = null;
             OnFrame?.Invoke(data, _config.RowCount, _config.ColCount);
         }
 
@@ -117,13 +118,14 @@ namespace DevicePipe
             return _touches;
         }
 
-        public ChessPieceInfo[] GetChessPieceInfo()
+        public PieceInfo[] GetPieceInfo()
         {
-            if (_data != null && _pieces == null)
+            if (_data != null && _solidPieces == null)
             {
-                _pieces = PressureAnalyzer.GetChessPieceInfo(_data, _config.RowCount, _config.ColCount);
+                var detected = PressureAnalyzer.GetPieceInfo(_data, _config.RowCount, _config.ColCount);
+                _solidPieces = _pieceTracker.Track(detected);
             }
-            return _pieces;
+            return _solidPieces;
         }
     }
 }

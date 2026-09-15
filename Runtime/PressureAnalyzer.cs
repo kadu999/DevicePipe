@@ -10,12 +10,84 @@ namespace DevicePipe
         public float radius;
     }
 
-    public struct ChessPieceInfo
+    public struct PieceInfo
     {
         public float pos_x, pos_y;
         public float radius;
-        public float dir_x, dir_y;
-        public float major, minor, angle;
+        /// <summary>Stable per-piece ID assigned by PieceTracker (readers fill this in).</summary>
+        public int id;
+    }
+
+    /// <summary>
+    /// Assigns stable IDs to detected pieces across frames: each new detection is
+    /// greedy-matched to the nearest previous piece within MatchDist and inherits
+    /// its ID; unmatched detections get fresh IDs, unmatched previous pieces are
+    /// forgotten. Port of the python TrajectoryTracker matching idea.
+    /// </summary>
+    public class PieceTracker
+    {
+        public const float MatchDist = 20f;
+
+        PieceInfo[] _prev = System.Array.Empty<PieceInfo>();
+        int _nextId = 1;
+
+        // Reused per-tracker scratch (grown on demand, never exposed)
+        bool[] _usedPrev = System.Array.Empty<bool>();
+        int[] _idOf = System.Array.Empty<int>();
+        readonly List<(float d, int pi, int di)> _pairs =
+            new List<(float d, int pi, int di)>(64);
+
+        public PieceInfo[] Track(PieceInfo[] detected)
+        {
+            if (detected == null || detected.Length == 0)
+            {
+                _prev = System.Array.Empty<PieceInfo>();
+                return detected ?? System.Array.Empty<PieceInfo>();
+            }
+
+            var result = new PieceInfo[detected.Length];
+            if (_usedPrev.Length < _prev.Length) _usedPrev = new bool[_prev.Length];
+            System.Array.Clear(_usedPrev, 0, _prev.Length);
+            if (_idOf.Length < detected.Length) _idOf = new int[detected.Length];
+            else System.Array.Clear(_idOf, 0, detected.Length);
+            var usedPrev = _usedPrev;
+            var idOf = _idOf;
+
+            // Greedy nearest-neighbor matching by ascending distance
+            var pairs = _pairs;
+            pairs.Clear();
+            for (int d = 0; d < detected.Length; d++)
+                for (int p = 0; p < _prev.Length; p++)
+                {
+                    float dx = detected[d].pos_x - _prev[p].pos_x;
+                    float dy = detected[d].pos_y - _prev[p].pos_y;
+                    float dist = Mathf.Sqrt(dx * dx + dy * dy);
+                    if (dist <= MatchDist) pairs.Add((dist, p, d));
+                }
+            pairs.Sort((a, b) => a.d.CompareTo(b.d));
+            foreach (var (d, pi, di) in pairs)
+            {
+                if (usedPrev[pi] || idOf[di] != 0) continue;
+                usedPrev[pi] = true;
+                idOf[di] = _prev[pi].id;
+            }
+
+            for (int i = 0; i < detected.Length; i++)
+            {
+                var p = detected[i];
+                p.id = idOf[i] != 0 ? idOf[i] : _nextId++;
+                result[i] = p;
+            }
+
+            _prev = (PieceInfo[])result.Clone(); // defensive copy; callers may mutate their array
+            return result;
+        }
+
+        public void Reset()
+        {
+            _prev = System.Array.Empty<PieceInfo>();
+            _nextId = 1;
+        }
     }
 
     public enum RadiusMode { Direction, Square }
@@ -29,7 +101,7 @@ namespace DevicePipe
 
         // ── Touch Filter (ported from ring_pressure_viewer.py) ──────────────
         // Master switch — when ON, GetPressureInfo applies the filter chain:
-        //   area/strength → ring-boundary exclusion → inside-piece exclusion → temporal EMA
+        //   area/strength → inside-piece exclusion → temporal EMA
         public static bool FilterEnabled = false;
 
         // Stage 1: area & strength (python: π·r² ≥ 20 and peak ≥ 60)
@@ -40,15 +112,11 @@ namespace DevicePipe
         //   TOUCH_THRESHOLD = 12 and square-expansion radius until a pixel < 1
         public static float FilterDetectThreshold = 12f;
 
-        // Stage 2: drop touches whose distance to a ring's ellipse boundary is < this
-        public static bool FilterExcludeNearRings = true;
-        public static float FilterRingExcludeDist = 4f;
-
-        // Stage 3: drop touches inside a detected piece circle (python _detect_pieces,
+        // Stage 2: drop touches inside a detected piece circle (python _detect_pieces,
         // which runs on peak-held data with tighter shape thresholds)
         public static bool FilterExcludeInsidePieces = true;
 
-        // Stage 4 (extension beyond the python pipeline): temporal EMA smoothing
+        // Stage 3 (extension beyond the python pipeline): temporal EMA smoothing
         // across frames (0 = off → behaves exactly like python; >0 blends each touch
         // with its nearest previous filtered touch)
         public static float FilterTemporalAlpha = 0f;
@@ -58,6 +126,7 @@ namespace DevicePipe
         static bool _filterWasEnabled;
 
         // ── Piece detection state (python _apply_peak_hold + _detect_pieces) ──
+        const int SkeletonThresh = 25;
         const int MinPieceArea = 10;
         const float PieceCircThresh = 0.60f;
         const float PieceAspectThresh = 1.7f;
@@ -72,18 +141,17 @@ namespace DevicePipe
         static float[,] _bufA, _bufB;
         static int _w, _h;
 
-        // ── Ring / Chess Piece Detection ──────────────────────
-        const int SkeletonThresh = 25;
-        const float CircThresh = 0.4f;
-        const float AspectThresh = 3.0f;
-        const int MinRingArea = 10;
-
         static byte[] _binBuf;
-        static byte[] _skelA;
-        static byte[] _skelB;
         static int[] _labelBuf;
         static int[] _bfsQueue;
         static int _bufCapacity;
+
+        // ── Reused scratch collections (cleared on each use — never hold across calls) ──
+        static readonly List<ComponentInfo> _components = new List<ComponentInfo>(64);
+        static readonly List<(int x, int y)> _contour = new List<(int x, int y)>(256);
+        static readonly List<(float cx, float cy, float r)> _pieces = new List<(float, float, float)>(16);
+        static readonly List<(int x, int y, float val)> _peaks = new List<(int x, int y, float val)>(16);
+        static readonly List<PressureInfo> _piScratch = new List<PressureInfo>(16);
 
         static readonly int[] NeighborDx8 = {  0,  1,  1,  1,  0, -1, -1, -1 };
         static readonly int[] NeighborDy8 = { -1, -1,  0,  1,  1,  1,  0, -1 };
@@ -93,8 +161,6 @@ namespace DevicePipe
             if (_bufCapacity >= size) return;
             _bufCapacity = size;
             _binBuf = new byte[size];
-            _skelA = new byte[size];
-            _skelB = new byte[size];
             _labelBuf = new int[size];
             _bfsQueue = new int[size];
         }
@@ -169,7 +235,8 @@ namespace DevicePipe
                 }
 
             // Find local maxima in _bufB
-            var peaks = new List<(int x, int y, float val)>(16);
+            var peaks = _peaks;
+            peaks.Clear();
             int half = Neighborhood / 2;
             // python TOUCH_THRESHOLD=12 while the filter is on, else the C# Threshold
             float thr = enableFilter ? FilterDetectThreshold : Threshold;
@@ -191,7 +258,8 @@ namespace DevicePipe
 
             // Sort by pressure, merge close peaks
             peaks.Sort((a, b) => b.val.CompareTo(a.val));
-            var result = new List<PressureInfo>();
+            var result = _piScratch;
+            result.Clear();
             foreach (var p in peaks)
             {
                 bool tooClose = false;
@@ -226,15 +294,14 @@ namespace DevicePipe
         /// <summary>
         /// Post-detection filters, mirroring ring_pressure_viewer.py _render():
         ///   1. area & strength: keep π·r² ≥ FilterMinArea and pressure ≥ FilterMinPressure
-        ///   2. ring-boundary exclusion: drop touches within FilterRingExcludeDist of a
-        ///      detected ring's ellipse boundary (python _filter_touches_near_rings)
-        ///   3. inside-piece exclusion: drop touches inside a detected piece circle
+        ///   2. inside-piece exclusion: drop touches inside a detected piece circle
         ///      (python _detect_pieces on peak-held data)
         /// </summary>
         static PressureInfo[] ApplyTouchFilter(PressureInfo[] touches, int[] data, int inW, int inH)
         {
             // ── Stage 1: area & strength (python: π·r² ≥ 20 and peak ≥ 60) ──
-            var list = new List<PressureInfo>(touches.Length);
+            var list = _piScratch;
+            list.Clear();
             foreach (var t in touches)
             {
                 if (FilterMinArea > 0f && Mathf.PI * t.radius * t.radius < FilterMinArea) continue;
@@ -244,28 +311,11 @@ namespace DevicePipe
             if (list.Count == 0) return System.Array.Empty<PressureInfo>();
             PressureInfo[] current = list.ToArray();
 
-            // ── Stage 2: ring-boundary exclusion (python _filter_touches_near_rings) ──
-            if (FilterExcludeNearRings)
-            {
-                ChessPieceInfo[] rings = GetChessPieceInfo(data, inW, inH);
-                var kept = new List<PressureInfo>(current.Length);
-                foreach (var t in current)
-                {
-                    bool drop = false;
-                    for (int i = 0; i < rings.Length && !drop; i++)
-                        if (DistToEllipseBoundary(t.x, t.y, rings[i]) <= FilterRingExcludeDist)
-                            drop = true;
-                    if (!drop) kept.Add(t);
-                }
-                current = kept.ToArray();
-                if (current.Length == 0) return current;
-            }
-
-            // ── Stage 3: inside-piece exclusion (python _detect_pieces) ──
+            // ── Stage 2: inside-piece exclusion (python _detect_pieces) ──
             if (FilterExcludeInsidePieces)
             {
                 var pieces = DetectPieces(data, inW, inH);
-                var kept = new List<PressureInfo>(current.Length);
+                list.Clear();
                 foreach (var t in current)
                 {
                     bool inside = false;
@@ -276,42 +326,12 @@ namespace DevicePipe
                         if (dx * dx + dy * dy < pieces[i].Item3 * pieces[i].Item3)
                             inside = true;
                     }
-                    if (!inside) kept.Add(t);
+                    if (!inside) list.Add(t);
                 }
-                current = kept.ToArray();
+                current = list.ToArray();
             }
 
             return current;
-        }
-
-        /// <summary>
-        /// Distance from point (px, py) to the boundary of ring's fitted ellipse.
-        /// Python uses cv2.ellipse2Poly (1° steps → 360 points) to discretize the
-        /// boundary; we sample the same 360 parametric points and take the min distance.
-        /// </summary>
-        static float DistToEllipseBoundary(float px, float py, ChessPieceInfo ring)
-        {
-            float a = ring.major * 0.5f;
-            float b = ring.minor * 0.5f;
-            if (a <= 0f || b <= 0f) return float.MaxValue;
-
-            float cx = ring.pos_x, cy = ring.pos_y;
-            float theta = ring.angle * Mathf.Deg2Rad;
-            float cosT = Mathf.Cos(theta), sinT = Mathf.Sin(theta);
-
-            float bestSq = float.MaxValue;
-            const int N = 360;
-            for (int i = 0; i < N; i++)
-            {
-                float t = i * (2f * Mathf.PI) / N;
-                float ct = Mathf.Cos(t), st = Mathf.Sin(t);
-                float ex = cx + a * ct * cosT - b * st * sinT;
-                float ey = cy + a * ct * sinT + b * st * cosT;
-                float dx = px - ex, dy = py - ey;
-                float d = dx * dx + dy * dy;
-                if (d < bestSq) bestSq = d;
-            }
-            return Mathf.Sqrt(bestSq);
         }
 
         // ── Piece detection (port of python _apply_peak_hold + _detect_pieces) ──
@@ -373,7 +393,10 @@ namespace DevicePipe
             // cv2.findContours(RETR_EXTERNAL) ≈ 8-connected component labeling
             var components = FindComponents(_binBuf, _labelBuf, _bfsQueue, inH, inW);
 
-            var pieces = new List<(float, float, float)>();
+            // SHARED scratch: valid only until the next DetectPieces call.
+            // Both callers (GetPieceInfo, ApplyTouchFilter) consume it immediately.
+            var pieces = _pieces;
+            pieces.Clear();
             foreach (var comp in components)
                 if (TryFitPiece(_binBuf, _labelBuf, comp.compId, comp, inH, inW, out var p))
                     pieces.Add(p);
@@ -392,31 +415,24 @@ namespace DevicePipe
             // python: area < MIN_AREA → reject
             if (comp.pixelCount < MinPieceArea) return false;
 
-            int total = w * h;
-            var points = new List<(int x, int y)>(comp.pixelCount);
-            for (int i = 0; i < total; i++)
-                if (labels[i] == compId)
-                    points.Add((i / h, i % h));
+            // python feeds cv2.findContours/area/arcLength/fitEllipse the outer boundary
+            // contour only, in boundary-walk order. Moore-neighbor tracing gives that
+            // ordering; sorting pixel centers by angle inflates the perimeter (consecutive
+            // points can sit far apart across staircase corners) and kills circularity.
+            List<(int x, int y)> contour = TraceOuterContour(labels, compId, w, h);
+            if (contour.Count < 5) return false;
 
             float cx = (float)comp.sumX / comp.pixelCount;
             float cy = (float)comp.sumY / comp.pixelCount;
 
-            // Sort by angle around centroid (for polygon area/perimeter)
-            points.Sort((a, b) =>
-            {
-                float angA = Mathf.Atan2(a.y - cy, a.x - cx);
-                float angB = Mathf.Atan2(b.y - cy, b.x - cx);
-                return angA.CompareTo(angB);
-            });
-
             // ── Polygon area (shoelace) and perimeter → circularity ──
             float polyArea = 0f, perimeter = 0f;
-            int npts = points.Count;
+            int npts = contour.Count;
             for (int i = 0; i < npts; i++)
             {
                 int j = (i + 1) % npts;
-                float x1 = points[i].x, y1 = points[i].y;
-                float x2 = points[j].x, y2 = points[j].y;
+                float x1 = contour[i].x, y1 = contour[i].y;
+                float x2 = contour[j].x, y2 = contour[j].y;
                 polyArea += x1 * y2 - x2 * y1;
                 float dx = x2 - x1, dy = y2 - y1;
                 perimeter += Mathf.Sqrt(dx * dx + dy * dy);
@@ -429,12 +445,12 @@ namespace DevicePipe
                 if (circularity < PieceCircThresh) return false;
             }
 
-            // ── PCA ellipse fit (python: cv2.fitEllipse) ──
+            // ── PCA ellipse fit (python: cv2.fitEllipse on contour points) ──
             float covXX = 0f, covYY = 0f, covXY = 0f;
             for (int i = 0; i < npts; i++)
             {
-                float dx = points[i].x - cx;
-                float dy = points[i].y - cy;
+                float dx = contour[i].x - cx;
+                float dy = contour[i].y - cy;
                 covXX += dx * dx;
                 covYY += dy * dy;
                 covXY += dx * dy;
@@ -461,6 +477,60 @@ namespace DevicePipe
 
             piece = (cx, cy, radius);
             return true;
+        }
+
+        /// <summary>
+        /// Moore-neighbor tracing of a component's outer boundary, in walk order
+        /// (what cv2.findContours returns). Clockwise probe starting just after the
+        /// backtrack pixel; Jacob-style stop on re-entering the start pixel.
+        /// </summary>
+        static List<(int x, int y)> TraceOuterContour(int[] labels, int compId, int w, int h)
+        {
+            // SHARED scratch: valid only until the next TraceOuterContour call
+            // (TryFitPiece consumes it immediately).
+            var contour = _contour;
+            contour.Clear();
+            int total = w * h;
+
+            // Start: topmost, then leftmost component pixel
+            int sx = -1, sy = -1;
+            for (int y = 0; y < h && sx < 0; y++)
+                for (int x = 0; x < w; x++)
+                    if (labels[x * h + y] == compId) { sx = x; sy = y; break; }
+            if (sx < 0) return contour;
+
+            // Initial backtrack: any direction pointing at background/out of bounds
+            int dir = 0;
+            for (int d = 0; d < 8; d++)
+            {
+                int nx = sx + NeighborDx8[d], ny = sy + NeighborDy8[d];
+                if ((uint)nx >= (uint)w || (uint)ny >= (uint)h || labels[nx * h + ny] != compId)
+                { dir = d; break; }
+            }
+
+            int cx = sx, cy = sy;
+            contour.Add((cx, cy));
+
+            int maxSteps = total + 16; // safety cap; a closed border walk visits each pixel ≤ ~2×
+            for (int step = 0; step < maxSteps; step++)
+            {
+                bool moved = false;
+                for (int k = 1; k <= 8; k++)
+                {
+                    int nd = (dir + k) % 8;
+                    int nx = cx + NeighborDx8[nd], ny = cy + NeighborDy8[nd];
+                    if ((uint)nx >= (uint)w || (uint)ny >= (uint)h || labels[nx * h + ny] != compId)
+                        continue;
+                    if (nx == sx && ny == sy) return contour; // closed the loop
+                    dir = (nd + 4) % 8; // backtrack pixel = where we came from
+                    cx = nx; cy = ny;
+                    contour.Add((cx, cy));
+                    moved = true;
+                    break;
+                }
+                if (!moved) break; // isolated pixel, nothing more to trace
+            }
+            return contour;
         }
 
         /// <summary>
@@ -570,7 +640,7 @@ namespace DevicePipe
             return r;
         }
 
-        // ── Ring / Chess Piece Detection ──────────────────────
+        // ── Connected components ──────────────────────
 
         struct ComponentInfo
         {
@@ -579,96 +649,17 @@ namespace DevicePipe
             public int compId;
         }
 
-        static void GetNeighbors8(byte[] buf, int x, int y, int w, int h, int[] n)
-        {
-            for (int d = 0; d < 8; d++)
-            {
-                int nx = x + NeighborDx8[d];
-                int ny = y + NeighborDy8[d];
-                n[d] = ((uint)nx < (uint)w && (uint)ny < (uint)h && buf[nx * h + ny] != 0) ? 1 : 0;
-            }
-        }
-
-        static int CountNeighbors8(int[] n)
-        {
-            int sum = 0;
-            for (int i = 0; i < 8; i++) sum += n[i];
-            return sum;
-        }
-
-        static int TransitionCount(int[] n)
-        {
-            int transitions = 0;
-            for (int i = 0; i < 8; i++)
-                if (n[i] == 0 && n[(i + 1) % 8] == 1) transitions++;
-            return transitions;
-        }
-
-        static void ApplyBinaryThreshold(int[] data, byte[] binary, int w, int h, int threshold)
-        {
-            int total = w * h;
-            for (int i = 0; i < total; i++)
-                binary[i] = data[i] > threshold ? (byte)1 : (byte)0;
-        }
-
-        /// <summary>Zhang-Suen thinning. Input in binary, result in _skelA.</summary>
-        static void ZhangSuenSkeletonize(byte[] binary, byte[] skelA, byte[] skelB, int w, int h)
-        {
-            int total = w * h;
-            System.Array.Copy(binary, skelA, total);
-            int[] n = new int[8];
-            bool changed;
-
-            do
-            {
-                changed = false;
-
-                // ── Sub-iteration 1 ──
-                System.Array.Copy(skelA, skelB, total);
-                for (int i = 0; i < total; i++)
-                {
-                    if (skelA[i] == 0) continue;
-                    int x = i / h, y = i % h;
-                    GetNeighbors8(skelA, x, y, w, h, n);
-                    int B = CountNeighbors8(n);
-                    if (B < 2 || B > 6) continue;
-                    if (TransitionCount(n) != 1) continue;
-                    // P2*P4*P6 == 0  (n[0]*n[2]*n[4])
-                    if (n[0] != 0 && n[2] != 0 && n[4] != 0) continue;
-                    // P4*P6*P8 == 0  (n[2]*n[4]*n[6])
-                    if (n[2] != 0 && n[4] != 0 && n[6] != 0) continue;
-                    skelB[i] = 0;
-                    changed = true;
-                }
-
-                // ── Sub-iteration 2 ──
-                System.Array.Copy(skelB, skelA, total);
-                for (int i = 0; i < total; i++)
-                {
-                    if (skelB[i] == 0) continue;
-                    int x = i / h, y = i % h;
-                    GetNeighbors8(skelB, x, y, w, h, n);
-                    int B = CountNeighbors8(n);
-                    if (B < 2 || B > 6) continue;
-                    if (TransitionCount(n) != 1) continue;
-                    // P2*P4*P8 == 0  (n[0]*n[2]*n[6])
-                    if (n[0] != 0 && n[2] != 0 && n[6] != 0) continue;
-                    // P2*P6*P8 == 0  (n[0]*n[4]*n[6])
-                    if (n[0] != 0 && n[4] != 0 && n[6] != 0) continue;
-                    skelA[i] = 0;
-                    changed = true;
-                }
-            } while (changed);
-            // result is in _skelA
-        }
-
-        /// <summary>BFS connected-component labeling on skeleton (8-connected).</summary>
+        /// <summary>BFS connected-component labeling (8-connected).
+        /// Returns SHARED scratch _components: valid only until the next
+        /// FindComponents call; callers must consume it immediately (and must not
+        /// call anything that re-enters FindComponents while iterating).</summary>
         static List<ComponentInfo> FindComponents(
             byte[] skeleton, int[] labels, int[] queue, int w, int h)
         {
             int total = w * h;
             System.Array.Clear(labels, 0, total);
-            var components = new List<ComponentInfo>();
+            var components = _components;
+            components.Clear();
             int compId = 0;
 
             for (int seed = 0; seed < total; seed++)
@@ -711,183 +702,28 @@ namespace DevicePipe
             return components;
         }
 
-        /// <summary>Validate ring shape and fill ChessPieceInfo.</summary>
-        static bool TryFitRing(byte[] skeleton, int[] labels, int compId,
-                               ComponentInfo comp, int w, int h, out ChessPieceInfo result)
+        /// <summary>Detect solid circular pieces from pressure frame.</summary>
+        public static PieceInfo[] GetPieceInfo(int[] data, int width, int height)
         {
-            result = default;
-
-            // ── Area filter ──
-            if (comp.pixelCount < MinRingArea) return false;
-
-            // ── Collect component pixels ──
-            int total = w * h;
-            var points = new List<(int x, int y)>(comp.pixelCount);
-            for (int i = 0; i < total; i++)
-                if (labels[i] == compId)
-                    points.Add((i / h, i % h));
-
-            // ── Robust center: filter out lever pixels by distance ──
-            // Mean center is biased toward lever; ring pixels all sit at ~same
-            // distance from true center. Filter to the dominant distance band.
-            float cx0 = (float)comp.sumX / comp.pixelCount;
-            float cy0 = (float)comp.sumY / comp.pixelCount;
-
-            var dists = new float[points.Count];
-            for (int i = 0; i < points.Count; i++)
-                dists[i] = Mathf.Sqrt((points[i].x - cx0) * (points[i].x - cx0)
-                                    + (points[i].y - cy0) * (points[i].y - cy0));
-            System.Array.Sort(dists);
-            float medDist = dists[points.Count / 2];
-
-            // Recompute center from pixels near median distance (ring pixels)
-            float cx = 0f, cy = 0f;
-            int ringCount = 0;
-            float lo = medDist * 0.5f, hi = medDist * 1.5f;
-            for (int i = 0; i < points.Count; i++)
-            {
-                float d = Mathf.Sqrt((points[i].x - cx0) * (points[i].x - cx0)
-                                   + (points[i].y - cy0) * (points[i].y - cy0));
-                if (d >= lo && d <= hi)
-                {
-                    cx += points[i].x; cy += points[i].y; ringCount++;
-                }
-            }
-            if (ringCount < MinRingArea) return false;
-            cx /= ringCount; cy /= ringCount;
-
-            // Sort by angle around robust centroid (for polygon area/perimeter)
-            float sortCx = cx, sortCy = cy;
-            points.Sort((a, b) =>
-            {
-                float angA = Mathf.Atan2(a.y - sortCy, a.x - sortCx);
-                float angB = Mathf.Atan2(b.y - sortCy, b.x - sortCx);
-                return angA.CompareTo(angB);
-            });
-
-            // ── Polygon area (shoelace) and perimeter ──
-            float polyArea = 0f, perimeter = 0f;
-            int npts = points.Count;
-            for (int i = 0; i < npts; i++)
-            {
-                int j = (i + 1) % npts;
-                float x1 = points[i].x, y1 = points[i].y;
-                float x2 = points[j].x, y2 = points[j].y;
-                polyArea += x1 * y2 - x2 * y1;
-                float dx = x2 - x1, dy = y2 - y1;
-                perimeter += Mathf.Sqrt(dx * dx + dy * dy);
-            }
-            polyArea = Mathf.Abs(polyArea) * 0.5f;
-
-            // ── Circularity check ──
-            if (perimeter > 1e-6f)
-            {
-                float circularity = 4f * Mathf.PI * polyArea / (perimeter * perimeter);
-                if (circularity < CircThresh) return false;
-            }
-
-            // ── PCA ellipse fit ──
-            float covXX = 0f, covYY = 0f, covXY = 0f;
-            for (int i = 0; i < npts; i++)
-            {
-                float dx = points[i].x - cx;
-                float dy = points[i].y - cy;
-                covXX += dx * dx;
-                covYY += dy * dy;
-                covXY += dx * dy;
-            }
-            covXX /= npts; covYY /= npts; covXY /= npts;
-
-            float trace = covXX + covYY;
-            float det = covXX * covYY - covXY * covXY;
-            float disc = Mathf.Sqrt(Mathf.Max(0f, trace * trace - 4f * det));
-            float lambda1 = (trace + disc) * 0.5f; // larger
-            float lambda2 = (trace - disc) * 0.5f; // smaller
-
-            if (lambda2 < 1e-6f) return false; // degenerate
-
-            float major = 2f * Mathf.Sqrt(2f * lambda1);
-            float minor = 2f * Mathf.Sqrt(2f * lambda2);
-
-            // Eigenvector for major axis → ellipse orientation angle
-            float angle = 0f;
-            float vx = lambda1 - covYY;
-            float vy = covXY;
-            float vlen = Mathf.Sqrt(vx * vx + vy * vy);
-            if (vlen > 1e-6f)
-                angle = Mathf.Atan2(vy / vlen, vx / vlen) * Mathf.Rad2Deg;
-
-            // ── Aspect ratio check ──
-            float aspect = major / minor;
-            if (aspect > AspectThresh) return false;
-
-            // ── Junction detection (nearest branch point) ──
-            float jx = 0f, jy = 0f;
-            float bestDist = float.MaxValue;
-            bool found = false;
-            for (int i = 0; i < npts; i++)
-            {
-                int x = points[i].x, y = points[i].y;
-                int nCount = 0;
-                for (int d = 0; d < 8; d++)
-                {
-                    int nx = x + NeighborDx8[d];
-                    int ny = y + NeighborDy8[d];
-                    if ((uint)nx < (uint)w && (uint)ny < (uint)h && skeleton[nx * h + ny] != 0)
-                        nCount++;
-                }
-                if (nCount == 3)
-                {
-                    float dist = (x - cx) * (x - cx) + (y - cy) * (y - cy);
-                    if (dist < bestDist) { bestDist = dist; jx = x; jy = y; found = true; }
-                }
-            }
-
-            float dir_x = found ? jx - cx : 0f;
-            float dir_y = found ? jy - cy : 0f;
-            float radius = (major + minor) * 0.25f; // average semi-axis
-
-            result = new ChessPieceInfo
-            {
-                pos_x = cx, pos_y = cy,
-                radius = radius,
-                dir_x = dir_x, dir_y = dir_y,
-                major = major, minor = minor, angle = angle
-            };
-            return true;
-        }
-
-        /// <summary>Detect ring-shaped contacts (chess pieces) from pressure frame.</summary>
-        public static ChessPieceInfo[] GetChessPieceInfo(int[] data, int width, int height)
-        {
-            (width, height) = (height, width);
-
             if (data == null || width <= 0 || height <= 0)
-                return System.Array.Empty<ChessPieceInfo>();
+                return System.Array.Empty<PieceInfo>();
 
-            int total = width * height;
-            ResizeBufs(total);
+            // No (width, height) swap: passing the caller's dims here matches the
+            // touch-filter path's coordinate frame.
+            var pieces = DetectPieces(data, width, height);
+            if (pieces.Count == 0) return System.Array.Empty<PieceInfo>();
 
-            // Stage 1: binary threshold
-            ApplyBinaryThreshold(data, _binBuf, width, height, SkeletonThresh);
-
-            // Stage 2: Zhang-Suen skeletonization → _skelA
-            ZhangSuenSkeletonize(_binBuf, _skelA, _skelB, width, height);
-
-            // Stage 3: connected components
-            var components = FindComponents(_skelA, _labelBuf, _bfsQueue, width, height);
-
-            // Stage 4-5: filter + fit + junction → results
-            var results = new List<ChessPieceInfo>();
-            foreach (var comp in components)
-            {
-                if (TryFitRing(_skelA, _labelBuf, comp.compId, comp,
-                               width, height, out var piece))
-                    results.Add(piece);
-            }
-
-            return results.Count > 0 ? results.ToArray() : System.Array.Empty<ChessPieceInfo>();
+            var results = new PieceInfo[pieces.Count];
+            for (int i = 0; i < pieces.Count; i++)
+                results[i] = new PieceInfo
+                {
+                    pos_x = pieces[i].Item1,
+                    pos_y = pieces[i].Item2,
+                    radius = pieces[i].Item3,
+                };
+            return results;
         }
+
 
         static void EnsureKernel()
         {

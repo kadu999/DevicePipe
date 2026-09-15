@@ -27,6 +27,9 @@ namespace DevicePipe
         int[] _zeros; // 单板模式或未就绪侧全零填充
         int _frameCountA, _frameCountB;
 
+        PieceInfo[] _solidPieces; // per-frame cache, invalidated in Merge()
+        readonly PieceTracker _pieceTracker = new PieceTracker();
+
         int[] Zeros => _zeros ?? (_zeros = new int[_cellCount]);
 
         public bool IsOpen =>
@@ -139,10 +142,15 @@ namespace DevicePipe
             return PressureAnalyzer.GetPressureInfo(_merged, _row, _col * 2, mode, enableFilter);
         }
 
-        public ChessPieceInfo[] GetChessPieceInfo()
+        public PieceInfo[] GetPieceInfo()
         {
-            if (_merged == null) return System.Array.Empty<ChessPieceInfo>();
-            return PressureAnalyzer.GetChessPieceInfo(_merged, _row, _col * 2);
+            if (_merged == null) return System.Array.Empty<PieceInfo>();
+            if (_solidPieces == null)
+            {
+                var detected = PressureAnalyzer.GetPieceInfo(_merged, _row, _col * 2);
+                _solidPieces = _pieceTracker.Track(detected);
+            }
+            return _solidPieces;
         }
 
         void OnFrameA(int[] data, int w, int h)
@@ -180,6 +188,7 @@ namespace DevicePipe
             }
 
             OnFrame?.Invoke(_merged, outW, outH); // width, height
+            _solidPieces = null;
         }
     }
 }
