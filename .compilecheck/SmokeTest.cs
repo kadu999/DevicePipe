@@ -95,6 +95,9 @@ static class SmokeTest
         }
         Check(stressOk, "200× interleaved GetPieceInfo calls keep stable results");
 
+        // ── Test 7: ported T-shape (stamp) recogniser ──
+        _failures += TShapeTest.Run();
+
         Console.WriteLine(_failures == 0 ? "ALL TESTS PASSED" : $"{_failures} TEST(S) FAILED");
         return _failures == 0 ? 0 : 1;
     }

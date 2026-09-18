@@ -175,6 +175,7 @@ namespace DevicePipe
         // ── Reused scratch collections (cleared on each use — never hold across calls) ──
         static readonly List<ComponentInfo> _components = new List<ComponentInfo>(64);
         static readonly List<(int x, int y)> _contour = new List<(int x, int y)>(256);
+        static readonly List<(int x, int y)> _contourSimple = new List<(int x, int y)>(256);
         static readonly List<(float cx, float cy, float r)> _pieces = new List<(float, float, float)>(16);
         static readonly List<(int x, int y, float val)> _peaks = new List<(int x, int y, float val)>(16);
         static readonly List<PressureInfo> _piScratch = new List<PressureInfo>(16);
@@ -357,7 +358,16 @@ namespace DevicePipe
                 current = list.ToArray();
             }
 
-            return current;
+            // ── Stage 3: T-shape (stamp) exclusion — python :659-660 ──
+            // The mask is rebuilt once per frame by TShapeDetector.GetTShapes, which
+            // MatrixHeatmap must call before this; when no stamp was found (or the
+            // feature is off) InTShapeMask is always false and nothing is dropped.
+            list.Clear();
+            foreach (var t in current)
+                if (!TShapeDetector.InTShapeMask((int)t.x, (int)t.y))
+                    list.Add(t);
+
+            return list.ToArray();
         }
 
         // ── Piece detection (port of python _apply_peak_hold + _detect_pieces) ──
@@ -445,7 +455,22 @@ namespace DevicePipe
             // contour only, in boundary-walk order. Moore-neighbor tracing gives that
             // ordering; sorting pixel centers by angle inflates the perimeter (consecutive
             // points can sit far apart across staircase corners) and kills circularity.
-            List<(int x, int y)> contour = TraceOuterContour(labels, compId, w, h);
+            List<(int x, int y)> full = TraceOuterContour(labels, compId, w, h);
+            if (full.Count < 5) return false;
+
+            // Then collapse collinear runs, i.e. cv2.CHAIN_APPROX_SIMPLE.  This matters
+            // for polygons: python's `len(cnt) < 5` guard runs on the *simplified*
+            // contour, where a square is exactly 4 corners, while the raw Moore walk
+            // (~4·side points) would sail through — and a square has circularity
+            // π/4 = 0.785 and aspect 1, so it would be reported as a circular piece.
+            //
+            // Polygon area and perimeter are unchanged by dropping collinear points, but
+            // the PCA second moments are NOT (they are a mean over the point set) — and
+            // that is what we want here, because python fits its ellipse to this same
+            // simplified contour.  Verified: SimplifyContour reproduces
+            // cv2.CHAIN_APPROX_SIMPLE's point count *and* point set exactly
+            // (e.g. 70 -> 10, 106 -> 52, 76 -> 36).
+            List<(int x, int y)> contour = SimplifyContour(full);
             if (contour.Count < 5) return false;
 
             float cx = (float)comp.sumX / comp.pixelCount;
@@ -503,6 +528,34 @@ namespace DevicePipe
 
             piece = (cx, cy, radius);
             return true;
+        }
+
+        /// <summary>
+        /// Collapse collinear runs of a closed boundary walk (cv2.CHAIN_APPROX_SIMPLE):
+        /// keep a point only when the direction of travel changes there.
+        /// Returns SHARED scratch, valid until the next SimplifyContour call.
+        /// </summary>
+        static List<(int x, int y)> SimplifyContour(List<(int x, int y)> src)
+        {
+            var dst = _contourSimple;
+            dst.Clear();
+            int n = src.Count;
+            if (n < 3)
+            {
+                for (int i = 0; i < n; i++) dst.Add(src[i]);
+                return dst;
+            }
+            for (int i = 0; i < n; i++)
+            {
+                var prev = src[(i - 1 + n) % n];
+                var cur = src[i];
+                var next = src[(i + 1) % n];
+                int d1x = System.Math.Sign(cur.x - prev.x), d1y = System.Math.Sign(cur.y - prev.y);
+                int d2x = System.Math.Sign(next.x - cur.x), d2y = System.Math.Sign(next.y - cur.y);
+                if (d1x != d2x || d1y != d2y) dst.Add(cur);
+            }
+            if (dst.Count == 0) for (int i = 0; i < n; i++) dst.Add(src[i]);
+            return dst;
         }
 
         /// <summary>
@@ -740,13 +793,20 @@ namespace DevicePipe
             if (pieces.Count == 0) return System.Array.Empty<PieceInfo>();
 
             var results = new PieceInfo[pieces.Count];
+            int n = 0;
             for (int i = 0; i < pieces.Count; i++)
-                results[i] = new PieceInfo
+            {
+                // python :661-662 — drop pieces whose centre lands in the stamp mask
+                if (TShapeDetector.InTShapeMask((int)pieces[i].Item1, (int)pieces[i].Item2))
+                    continue;
+                results[n++] = new PieceInfo
                 {
                     pos_x = pieces[i].Item1,
                     pos_y = pieces[i].Item2,
                     radius = pieces[i].Item3,
                 };
+            }
+            if (n != results.Length) System.Array.Resize(ref results, n);
             return results;
         }
 

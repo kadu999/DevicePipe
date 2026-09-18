@@ -20,6 +20,7 @@ namespace UnityEngine
 
         public static float Sqrt(float f) => (float)System.Math.Sqrt(f);
         public static float Abs(float f) => System.Math.Abs(f);
+        public static int Abs(int value) => System.Math.Abs(value);
         public static float Exp(float f) => (float)System.Math.Exp(f);
         public static float Cos(float f) => (float)System.Math.Cos(f);
         public static float Sin(float f) => (float)System.Math.Sin(f);

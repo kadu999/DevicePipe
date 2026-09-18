@@ -1,6 +1,6 @@
 {
   "name": "com.kadu999.device-pipe",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "displayName": "DevicePipe",
   "description": "Device data pipeline: serial reader, frame decoder, CRC, and pressure analysis.",
   "unity": "2022.3",

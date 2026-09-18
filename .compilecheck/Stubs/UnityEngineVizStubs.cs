@@ -121,6 +121,7 @@ namespace UnityEngine
     {
         public Texture2D(int width, int height, TextureFormat format, bool mipChain) { }
         public void SetPixels(Color[] colors) { }
+        public void SetPixel(int x, int y, Color color) { }
         public void Apply() { }
     }
 

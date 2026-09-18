@@ -17,5 +17,6 @@
     <Compile Include="$(DeviceVizDir)/*.cs" />
     <Compile Include="Stubs/**/*.cs" />
     <Compile Include="SmokeTest.cs" />
+    <Compile Include="TShapeTest.cs" />
   </ItemGroup>
 </Project>
