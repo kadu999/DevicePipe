@@ -7,9 +7,14 @@
     <AssemblyName>compilecheck</AssemblyName>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
+  <PropertyGroup>
+    <!-- MSBuild globs can't traverse above the repo root, so DeviceViz needs an
+         absolute path. Override with -p:DeviceVizDir=... if your layout differs. -->
+    <DeviceVizDir Condition="'$(DeviceVizDir)' == ''">D:\work\DeviceViz\Runtime</DeviceVizDir>
+  </PropertyGroup>
   <ItemGroup>
     <Compile Include="../Runtime/*.cs" />
-    <Compile Include="../../../DeviceViz/Runtime/*.cs" />
+    <Compile Include="$(DeviceVizDir)/*.cs" />
     <Compile Include="Stubs/**/*.cs" />
     <Compile Include="SmokeTest.cs" />
   </ItemGroup>

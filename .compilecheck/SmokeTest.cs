@@ -67,7 +67,7 @@ static class SmokeTest
 
         var f4 = tracker.Track(new[]
         {
-            new PieceInfo { pos_x = 55, pos_y = 40, radius = 8 }, // moved > MatchDist → new id
+            new PieceInfo { pos_x = 60, pos_y = 45, radius = 8 }, // moved > MatchDist → new id
             new PieceInfo { pos_x = 11, pos_y = 10, radius = 6 }, // small move → keeps id 2
         });
         Check(f4.Length == 2 && f4[0].id != 1 && f4[1].id == 2,
@@ -75,8 +75,14 @@ static class SmokeTest
 
         tracker.Track(System.Array.Empty<PieceInfo>());
         var f6 = tracker.Track(new[] { new PieceInfo { pos_x = 11, pos_y = 10, radius = 6 } });
-        Check(f6.Length == 1 && f6[0].id != 2,
-            $"piece after empty-frame gap gets a fresh id (got {(f6.Length > 0 ? f6[0].id : -1)})");
+        Check(f6.Length == 1 && f6[0].id == 2,
+            $"piece after 1-frame gap keeps id 2 (lost-tolerance, got {(f6.Length > 0 ? f6[0].id : -1)})");
+
+        for (int i = 0; i < PieceTracker.LostTimeout; i++)
+            tracker.Track(System.Array.Empty<PieceInfo>());
+        var f7 = tracker.Track(new[] { new PieceInfo { pos_x = 11, pos_y = 10, radius = 6 } });
+        Check(f7.Length == 1 && f7[0].id != 2,
+            $"piece after {PieceTracker.LostTimeout}-frame gap gets a fresh id (got {(f7.Length > 0 ? f7[0].id : -1)})");
 
         // ── Test 6: scratch reuse — interleaved calls stay correct over many frames ──
         bool stressOk = true;

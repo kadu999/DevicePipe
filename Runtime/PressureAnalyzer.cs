@@ -21,14 +21,22 @@ namespace DevicePipe
     /// <summary>
     /// Assigns stable IDs to detected pieces across frames: each new detection is
     /// greedy-matched to the nearest previous piece within MatchDist and inherits
-    /// its ID; unmatched detections get fresh IDs, unmatched previous pieces are
-    /// forgotten. Port of the python TrajectoryTracker matching idea.
+    /// its ID; unmatched detections get fresh IDs. Previous pieces stay alive for
+    /// LostTimeout empty frames before their IDs are retired (python TrajectoryTracker
+    /// semantics: MATCH_DIST_THRESHOLD = 30, LOST_TIMEOUT = 5).
     /// </summary>
     public class PieceTracker
     {
-        public const float MatchDist = 20f;
+        public const float MatchDist = 30f;
+        public const int LostTimeout = 5;
 
-        PieceInfo[] _prev = System.Array.Empty<PieceInfo>();
+        struct Tracked
+        {
+            public PieceInfo info;
+            public int misses;
+        }
+
+        Tracked[] _prev = System.Array.Empty<Tracked>();
         int _nextId = 1;
 
         // Reused per-tracker scratch (grown on demand, never exposed)
@@ -39,28 +47,38 @@ namespace DevicePipe
 
         public PieceInfo[] Track(PieceInfo[] detected)
         {
-            if (detected == null || detected.Length == 0)
+            int n = detected?.Length ?? 0;
+
+            // Age out tracks that have been missing for too long
+            int kept = 0;
+            for (int i = 0; i < _prev.Length; i++)
+                if (_prev[i].misses < LostTimeout) _prev[kept++] = _prev[i];
+            if (kept != _prev.Length)
+                System.Array.Resize(ref _prev, kept);
+
+            if (n == 0)
             {
-                _prev = System.Array.Empty<PieceInfo>();
-                return detected ?? System.Array.Empty<PieceInfo>();
+                for (int i = 0; i < _prev.Length; i++)
+                    _prev[i].misses++;
+                return System.Array.Empty<PieceInfo>();
             }
 
-            var result = new PieceInfo[detected.Length];
+            var result = new PieceInfo[n];
             if (_usedPrev.Length < _prev.Length) _usedPrev = new bool[_prev.Length];
             System.Array.Clear(_usedPrev, 0, _prev.Length);
-            if (_idOf.Length < detected.Length) _idOf = new int[detected.Length];
-            else System.Array.Clear(_idOf, 0, detected.Length);
+            if (_idOf.Length < n) _idOf = new int[n];
+            else System.Array.Clear(_idOf, 0, n);
             var usedPrev = _usedPrev;
             var idOf = _idOf;
 
             // Greedy nearest-neighbor matching by ascending distance
             var pairs = _pairs;
             pairs.Clear();
-            for (int d = 0; d < detected.Length; d++)
+            for (int d = 0; d < n; d++)
                 for (int p = 0; p < _prev.Length; p++)
                 {
-                    float dx = detected[d].pos_x - _prev[p].pos_x;
-                    float dy = detected[d].pos_y - _prev[p].pos_y;
+                    float dx = detected[d].pos_x - _prev[p].info.pos_x;
+                    float dy = detected[d].pos_y - _prev[p].info.pos_y;
                     float dist = Mathf.Sqrt(dx * dx + dy * dy);
                     if (dist <= MatchDist) pairs.Add((dist, p, d));
                 }
@@ -69,23 +87,31 @@ namespace DevicePipe
             {
                 if (usedPrev[pi] || idOf[di] != 0) continue;
                 usedPrev[pi] = true;
-                idOf[di] = _prev[pi].id;
+                idOf[di] = _prev[pi].info.id;
             }
 
-            for (int i = 0; i < detected.Length; i++)
+            for (int i = 0; i < n; i++)
             {
                 var p = detected[i];
                 p.id = idOf[i] != 0 ? idOf[i] : _nextId++;
                 result[i] = p;
             }
 
-            _prev = (PieceInfo[])result.Clone(); // defensive copy; callers may mutate their array
+            // Next frame's tracks: current detections, plus unmatched old tracks
+            // carried forward and aged (retired after LostTimeout misses)
+            var next = new List<Tracked>(n + _prev.Length);
+            for (int i = 0; i < n; i++)
+                next.Add(new Tracked { info = result[i], misses = 0 });
+            for (int p = 0; p < _prev.Length; p++)
+                if (!usedPrev[p])
+                    next.Add(new Tracked { info = _prev[p].info, misses = _prev[p].misses + 1 });
+            _prev = next.ToArray();
             return result;
         }
 
         public void Reset()
         {
-            _prev = System.Array.Empty<PieceInfo>();
+            _prev = System.Array.Empty<Tracked>();
             _nextId = 1;
         }
     }

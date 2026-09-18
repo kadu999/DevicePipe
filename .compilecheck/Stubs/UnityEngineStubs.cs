@@ -29,6 +29,7 @@ namespace UnityEngine
         public static int Max(int a, int b) => System.Math.Max(a, b);
         public static int Min(int a, int b) => System.Math.Min(a, b);
         public static float Clamp(float value, float min, float max) => value < min ? min : value > max ? max : value;
+        public static float Clamp01(float value) => value < 0f ? 0f : value > 1f ? 1f : value;
         public static int CeilToInt(float f) => (int)System.Math.Ceiling(f);
         public static int RoundToInt(float f) => (int)System.Math.Round(f);
     }
