@@ -28,6 +28,7 @@ namespace DevicePipe
         int _frameCountA, _frameCountB;
 
         PieceInfo[] _solidPieces; // per-frame cache, invalidated in Merge()
+        TShapeInfo[] _tShapes;    // per-frame cache, invalidated in Merge()
         readonly PieceTracker _pieceTracker = new PieceTracker();
 
         int[] Zeros => _zeros ?? (_zeros = new int[_cellCount]);
@@ -153,6 +154,26 @@ namespace DevicePipe
             return _solidPieces;
         }
 
+        /// <summary>
+        /// T-shaped stamps (印章) detected in the current merged frame, with their
+        /// 4-bit id.  Cached per frame like <see cref="GetPieceInfo"/>.
+        ///
+        /// <para>Dimensions follow the merged layout built in <see cref="Merge"/>: each
+        /// group of <c>_col * 2</c> values is one row (left board then right board), so
+        /// the stride — and therefore the <c>width</c> argument — is <c>_col * 2</c>,
+        /// with <c>_row</c> groups.  This is the same pair <see cref="Merge"/> hands to
+        /// <c>OnFrame</c>.</para>
+        /// </summary>
+        public TShapeInfo[] GetTShapes()
+        {
+            if (_merged == null) return System.Array.Empty<TShapeInfo>();
+            if (_tShapes == null)
+            {
+                _tShapes = TShapeDetector.GetTShapes(_merged, _col * 2, _row);
+            }
+            return _tShapes;
+        }
+
         void OnFrameA(int[] data, int w, int h)
         {
             if (++_frameCountA == 1)
@@ -189,6 +210,7 @@ namespace DevicePipe
 
             OnFrame?.Invoke(_merged, outW, outH); // width, height
             _solidPieces = null;
+            _tShapes = null;
         }
     }
 }

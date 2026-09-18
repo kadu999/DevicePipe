@@ -194,6 +194,31 @@ static class TShapeTest
                 : " (no shape)"),
             fitOk);
 
+        // ── 11. one frame cannot advance the EMA twice ──
+        // A frame legitimately reaches GetTShapes from both MatrixHeatmap and a
+        // reader's GetTShapes(), so a repeat must not re-blend it (0.3 -> 0.51).
+        // Sequence: 200 -> blank gives 0.7*200 = 140 (> 100, detected); a *second*
+        // identical blank must be skipped, because advancing would give 98 (< 100).
+        TShapeDetector.ResetState();
+        var reused = new int[W * H];
+        Array.Copy(stamp, reused, stamp.Length);
+        var e1 = TShapeDetector.GetTShapes(reused, W, H);      // seeds smoothed = 200
+        Array.Clear(reused, 0, reused.Length);
+        var e2 = TShapeDetector.GetTShapes(reused, W, H);      // 0.7*200 = 140
+        var e3 = TShapeDetector.GetTShapes(reused, W, H);      // same frame -> skipped
+        Check(ref failures,
+            $"same frame does not advance the EMA twice: {e1.Length},{e2.Length},{e3.Length} (expect 1,1,1)",
+            e1.Length == 1 && e2.Length == 1 && e3.Length == 1);
+
+        // a fresh array with identical content is a new frame and must advance
+        TShapeDetector.ResetState();
+        var f1 = TShapeDetector.GetTShapes(stamp, W, H);
+        var f2 = TShapeDetector.GetTShapes(new int[W * H], W, H);
+        var f3 = TShapeDetector.GetTShapes(new int[W * H], W, H);
+        Check(ref failures,
+            $"distinct frames still advance: {f1.Length},{f2.Length},{f3.Length} (expect 1,1,0)",
+            f1.Length == 1 && f2.Length == 1 && f3.Length == 0);
+
         return failures;
     }
 

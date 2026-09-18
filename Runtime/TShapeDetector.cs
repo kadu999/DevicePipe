@@ -70,9 +70,11 @@ namespace DevicePipe
     /// <c>y*width + x</c>.</para>
     ///
     /// <para><b>Per-frame contract</b> — like <c>DetectPieces</c>, this keeps static
-    /// state (the temporal EMA and the exclusion mask), so call
-    /// <see cref="GetTShapes"/> exactly once per frame.  Calling it twice in one frame
-    /// would advance the EMA twice.</para>
+    /// state (the temporal EMA and the exclusion mask).  One frame is normally consumed
+    /// twice: once by MatrixHeatmap's render path and once by a reader's
+    /// <c>GetTShapes()</c>.  The EMA therefore advances at most once per distinct frame
+    /// — a repeat of the frame just consumed (same array, dims and content) is skipped —
+    /// and detection is idempotent for identical input.</para>
     ///
     /// <para>Two deliberate deviations from python: the morphology border handling
     /// matches OpenCV (out-of-bounds neighbours are ignored for both erode and dilate),
@@ -119,6 +121,13 @@ namespace DevicePipe
         static float[] _smooth;
         static bool _smoothInit;
         static int _maskW, _maskH, _lastCount;
+
+        // Frame identity of the last EMA step, so one frame cannot advance it twice —
+        // see the guard in GetTShapes.
+        static int[] _frameRef;
+        static int _frameW, _frameH;
+        static ulong _frameHash;
+        static bool _frameConsumed;
 
         static readonly List<Comp> _comps = new List<Comp>(32);
         static readonly List<int> _px = new List<int>(512);
@@ -172,8 +181,23 @@ namespace DevicePipe
             int total = width * height;
             EnsureBufs(total);
 
+            // ── advance the temporal EMA at most once per frame ──
+            // The same frame legitimately reaches this method twice: MatrixHeatmap's
+            // render path and a reader's GetTShapes() both consume it.  Advancing twice
+            // would blend the frame with itself (alpha 0.3 -> 0.51), a silent deviation
+            // from the reference — so a repeat of the frame just consumed (same array,
+            // same dims, same content) is skipped.  DualSerialPressureReader reuses one
+            // merged buffer, which is why content is compared and not just the reference.
+            ulong hash = HashFrame(data, width, height);
+            bool sameFrame = _frameConsumed
+                             && ReferenceEquals(data, _frameRef)
+                             && width == _frameW && height == _frameH
+                             && hash == _frameHash;
+
             // python _try_parse_frame: smoothed = a*data + (1-a)*smoothed, seeded on frame 1
-            UpdateSmoothed(data, total);
+            if (!sameFrame) UpdateSmoothed(data, total);
+            _frameRef = data; _frameW = width; _frameH = height;
+            _frameHash = hash; _frameConsumed = true;
 
             // cv2.threshold(np.clip(smoothed,0,255).astype(uint8), thresh, THRESH_BINARY)
             for (int i = 0; i < total; i++)
@@ -258,6 +282,24 @@ namespace DevicePipe
             _smoothInit = false;
             _lastCount = 0;
             _maskW = _maskH = 0;
+            _frameConsumed = false;
+            _frameRef = null;
+            _frameHash = 0;
+        }
+
+        /// <summary>FNV-1a 64 over the frame plus its dimensions — frame identity for
+        /// the once-per-frame EMA guard.</summary>
+        static ulong HashFrame(int[] data, int w, int h)
+        {
+            ulong hash = 14695981039346656037UL;
+            for (int i = 0; i < data.Length; i++)
+            {
+                hash ^= (uint)data[i];
+                hash *= 1099511628211UL;
+            }
+            hash ^= (uint)w; hash *= 1099511628211UL;
+            hash ^= (uint)h; hash *= 1099511628211UL;
+            return hash;
         }
 
         // ══════════════════════════════════════════════════════════════

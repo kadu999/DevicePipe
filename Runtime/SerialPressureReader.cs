@@ -15,6 +15,7 @@ namespace DevicePipe
         int[] _data;
         PressureInfo[] _touches;
         PieceInfo[] _solidPieces;
+        TShapeInfo[] _tShapes;
         readonly PieceTracker _pieceTracker = new PieceTracker();
 
         public bool IsOpen => _bridge != null && _bridge.IsOpen;
@@ -106,6 +107,7 @@ namespace DevicePipe
             _data = data;
             _touches = null;
             _solidPieces = null;
+            _tShapes = null;
             OnFrame?.Invoke(data, _config.RowCount, _config.ColCount);
         }
 
@@ -126,6 +128,20 @@ namespace DevicePipe
                 _solidPieces = _pieceTracker.Track(detected);
             }
             return _solidPieces;
+        }
+
+        /// <summary>
+        /// T-shaped stamps (印章) detected in the current frame, with their 4-bit id.
+        /// Cached per frame like <see cref="GetPressureInfo"/> / <see cref="GetPieceInfo"/>,
+        /// so the detector's once-per-frame EMA contract is respected.
+        /// </summary>
+        public TShapeInfo[] GetTShapes()
+        {
+            if (_data != null && _tShapes == null)
+            {
+                _tShapes = TShapeDetector.GetTShapes(_data, _config.RowCount, _config.ColCount);
+            }
+            return _tShapes;
         }
     }
 }
