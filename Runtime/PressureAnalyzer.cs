@@ -122,8 +122,15 @@ namespace DevicePipe
     {
         const int Threshold = 3;
         const float Sigma = 1.0f;
+
+        // Local-maximum window for the plain (unfiltered) path, which keeps the
+        // historical broad-sensitivity defaults (see enableFilter below).
         const int Neighborhood = 5;
         const float MergeDist = 5.0f;
+
+        // Local-maximum window the reference viewer uses: PEAK_NEIGHBORHOOD = 3,
+        // i.e. a 3x3 window, so half-radius 1 (python maximum_filter sizes are odd).
+        const int FilterNeighborhood = 3;
 
         // ── Touch Filter (ported from ring_pressure_viewer.py) ──────────────
         // Master switch — when ON, GetPressureInfo applies the filter chain:
@@ -135,8 +142,11 @@ namespace DevicePipe
         public static float FilterMinPressure = 60f;
 
         // Detection (used only while the filter is ON — mirrors python TouchDetector):
-        //   TOUCH_THRESHOLD = 12 and square-expansion radius until a pixel < 1
-        public static float FilterDetectThreshold = 12f;
+        //   TOUCH_THRESHOLD = 60 and square-expansion radius until a pixel < 1.
+        // The reference peak detector now applies the same 60 the stage-1 strength
+        // filter uses, so the local-maximum test itself supplies the pressure gate
+        // (the later FilterMinPressure check stays as a no-op backstop).
+        public static float FilterDetectThreshold = 60f;
 
         // Stage 2: drop touches inside a detected piece circle (python _detect_pieces,
         // which runs on peak-held data with tighter shape thresholds)
@@ -178,7 +188,13 @@ namespace DevicePipe
         static readonly List<(int x, int y)> _contourSimple = new List<(int x, int y)>(256);
         static readonly List<(float cx, float cy, float r)> _pieces = new List<(float, float, float)>(16);
         static readonly List<(int x, int y, float val)> _peaks = new List<(int x, int y, float val)>(16);
+        static readonly List<(int x, int y, float val)> _peaksReduced = new List<(int x, int y, float val)>(16);
+        static readonly List<(int x, int y, float val)> _peaksMerged = new List<(int x, int y, float val)>(16);
         static readonly List<PressureInfo> _piScratch = new List<PressureInfo>(16);
+
+        // Peak-mask / flood-fill scratch for the 8-connected peak reduction
+        // (python cv2.connectedComponents on the maxima mask).
+        static bool[] _peakMark;
 
         static readonly int[] NeighborDx8 = {  0,  1,  1,  1,  0, -1, -1, -1 };
         static readonly int[] NeighborDy8 = { -1, -1,  0,  1,  1,  1,  0, -1 };
@@ -226,6 +242,9 @@ namespace DevicePipe
 
             EnsureKernel();
             Resize(width, height);
+            // Covers the peak-reduction flood fill as well as the piece-detection
+            // buffers, which share _bfsQueue.
+            ResizeBufs(width * height);
 
             int kr = _kernelRadius;
 
@@ -264,8 +283,10 @@ namespace DevicePipe
             // Find local maxima in _bufB
             var peaks = _peaks;
             peaks.Clear();
-            int half = Neighborhood / 2;
-            // python TOUCH_THRESHOLD=12 while the filter is on, else the C# Threshold
+            // python maximum_filter(size=Neighborhood) → square half-window; the
+            // reference uses PEAK_NEIGHBORHOOD = 3 while filtering is on.
+            int half = (enableFilter ? FilterNeighborhood : Neighborhood) / 2;
+            // python TOUCH_THRESHOLD=60 while the filter is on, else the C# Threshold
             float thr = enableFilter ? FilterDetectThreshold : Threshold;
             for (int x = 0; x < width; x++)
                 for (int y = 0; y < height; y++)
@@ -283,28 +304,41 @@ namespace DevicePipe
                     if (isMax) peaks.Add((x, y, v));
                 }
 
-            // Sort by pressure, merge close peaks
+            // Rank the surviving maxima, then reduce them to one touch each.
             peaks.Sort((a, b) => b.val.CompareTo(a.val));
             var result = _piScratch;
             result.Clear();
-            foreach (var p in peaks)
+
+            if (enableFilter)
             {
-                bool tooClose = false;
-                foreach (var r in result)
+                // python TouchDetector.detect: cv2.connectedComponents(peaks, 8) and
+                // keep argmax(smoothed) per component — touching maxima collapse into
+                // a single touch at the strongest pixel. Replaces the earlier
+                // _merge_close equivalent, which python retired along with the
+                // threshold change (PEAK_NEIGHBORHOOD 5 → 3 admits more peak pixels
+                // per blob, so component reduction is what keeps them one touch).
+                var reduced = ReduceComponentPeaks(_bufB, peaks, width, height);
+                AddTouches(reduced, true, mode);
+            }
+            else
+            {
+                // Legacy broad path unchanged: naive merge of peaks closer than
+                // MergeDist, keeping the stronger one.
+                var merged = _peaksMerged;
+                merged.Clear();
+                foreach (var p in peaks)
                 {
-                    float d = Mathf.Sqrt((p.x - r.x) * (p.x - r.x) + (p.y - r.y) * (p.y - r.y));
-                    if (d < MergeDist) { tooClose = true; break; }
+                    int hit = -1;
+                    for (int i = 0; i < merged.Count; i++)
+                    {
+                        var r = merged[i];
+                        float d = Mathf.Sqrt((p.x - r.x) * (p.x - r.x) + (p.y - r.y) * (p.y - r.y));
+                        if (d < MergeDist) { hit = i; break; }
+                    }
+                    if (hit < 0) merged.Add(p);
+                    else if (p.val > merged[hit].val) merged[hit] = p;
                 }
-                if (!tooClose)
-                {
-                    // python _estimate_radius: uniform square expansion until any pixel < 1
-                    float r = enableFilter
-                        ? ComputeRadiusBySquare(_bufB, p.x, p.y, absoluteThreshold: 1f)
-                        : mode == RadiusMode.Square
-                            ? ComputeRadiusBySquare(_bufB, p.x, p.y, absoluteThreshold: 3f)
-                            : ComputeRadiusByDirection(p.x, p.y, p.val);
-                    result.Add(new PressureInfo { x = p.x, y = p.y, pressure = (int)p.val, radius = r });
-                }
+                AddTouches(merged, false, mode);
             }
 
             PressureInfo[] touches = result.ToArray();
@@ -314,6 +348,84 @@ namespace DevicePipe
                 touches = ApplyTemporalSmoothing(touches);
             }
             return touches;
+        }
+
+        /// <summary>
+        /// Adds one <see cref="PressureInfo"/> per ranked peak to <see cref="_piScratch"/>,
+        /// deriving the radius the way the path in use does. <paramref name="enableFilter"/>
+        /// selects the python square-expansion estimator (reference <c>_estimate_radius</c>,
+        /// threshold 1) over the legacy Direction/Square radius modes.
+        /// </summary>
+        static void AddTouches(List<(int x, int y, float val)> ranked, bool enableFilter,
+                               RadiusMode mode)
+        {
+            foreach (var p in ranked)
+            {
+                // python _estimate_radius: uniform square expansion until any pixel < 1
+                float r = enableFilter
+                    ? ComputeRadiusBySquare(_bufB, p.x, p.y, absoluteThreshold: 1f)
+                    : mode == RadiusMode.Square
+                        ? ComputeRadiusBySquare(_bufB, p.x, p.y, absoluteThreshold: 3f)
+                        : ComputeRadiusByDirection(p.x, p.y, p.val);
+                _piScratch.Add(new PressureInfo { x = p.x, y = p.y, pressure = (int)p.val, radius = r });
+            }
+        }
+
+        /// <summary>
+        /// python <c>cv2.connectedComponents(peaks.astype(uint8), 8)</c> followed by
+        /// <c>argmax(smoothed[mask])</c>: partition the local-maximum mask into
+        /// 8-connected components and keep, from each, the pixel with the highest
+        /// smoothed value (first in row-major order on ties, matching numpy.argmax).
+        /// Order of the surviving peaks is irrelevant — the caller re-sorts by value.
+        /// </summary>
+        static List<(int x, int y, float val)> ReduceComponentPeaks(
+            float[,] smoothed, List<(int x, int y, float val)> peaks, int w, int h)
+        {
+            int total = w * h;
+            if (_peakMark == null || _peakMark.Length < total) _peakMark = new bool[total];
+            else System.Array.Clear(_peakMark, 0, total);
+
+            foreach (var p in peaks)
+            {
+                int idx = p.x * h + p.y;
+                if ((uint)idx < (uint)total) _peakMark[idx] = true;
+            }
+
+            // SHARED scratch, consumed by the caller before anything else runs.
+            var outPeaks = _peaksReduced;
+            outPeaks.Clear();
+
+            for (int seed = 0; seed < total; seed++)
+            {
+                if (!_peakMark[seed]) continue;
+
+                _peakMark[seed] = false;
+                int head = 0, tail = 0;
+                _bfsQueue[tail++] = seed;
+                int bestIdx = seed;
+                float bestVal = smoothed[seed / h, seed % h];
+
+                while (head < tail)
+                {
+                    int idx = _bfsQueue[head++];
+                    int x = idx / h, y = idx % h;
+                    for (int d = 0; d < 8; d++)
+                    {
+                        int nx = x + NeighborDx8[d], ny = y + NeighborDy8[d];
+                        if ((uint)nx >= (uint)w || (uint)ny >= (uint)h) continue;
+                        int nidx = nx * h + ny;
+                        if (!_peakMark[nidx]) continue;
+                        _peakMark[nidx] = false;
+                        _bfsQueue[tail++] = nidx;
+
+                        float nv = smoothed[nx, ny];
+                        if (nv > bestVal) { bestVal = nv; bestIdx = nidx; }
+                    }
+                }
+
+                outPeaks.Add((bestIdx / h, bestIdx % h, bestVal));
+            }
+            return outPeaks;
         }
 
         // ── Touch Filter chain (ported from ring_pressure_viewer.py) ────────
