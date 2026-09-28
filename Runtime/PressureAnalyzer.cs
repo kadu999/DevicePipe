@@ -1,3 +1,6 @@
+#if ALGBENCH_PROF
+using System.Diagnostics;
+#endif
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -169,18 +172,27 @@ namespace DevicePipe
         const float PieceRadiusMin = 4f;
 
         static float[] _peakBuf;
-        static byte[] _dilBuf;
         static int _peakW, _peakH;
 
         static float[] _kernel;
         static int _kernelRadius;
-        static float[,] _bufA, _bufB;
+        // Flat, row-major buffers (index = x * h + y): a float[,] charges a
+        // bounds check per index and hides the stride from the JIT.
+        static float[] _bufA, _bufB;
         static int _w, _h;
 
         static byte[] _binBuf;
         static int[] _labelBuf;
         static int[] _bfsQueue;
         static int _bufCapacity;
+
+        /// <summary>Source row bases for the horizontal Gaussian interior pass.</summary>
+        static int[] _tapRow;
+        static void EnsureTapRows(int kw)
+        {
+            if (_tapRow != null && _tapRow.Length >= kw) return;
+            _tapRow = new int[kw];
+        }
 
         // ── Reused scratch collections (cleared on each use — never hold across calls) ──
         static readonly List<ComponentInfo> _components = new List<ComponentInfo>(64);
@@ -212,8 +224,55 @@ namespace DevicePipe
         {
             if (_w == w && _h == h) return;
             _w = w; _h = h;
-            _bufA = new float[w, h];
-            _bufB = new float[w, h];
+            _bufA = new float[w * h];
+            _bufB = new float[w * h];
+        }
+
+#if ALGBENCH_PROF
+        internal static readonly long[] Prof = new long[10];
+        internal static long ProfStart;
+        static void ProfBegin() => ProfStart = Stopwatch.GetTimestamp();
+        static void ProfMark(int i)
+        {
+            long t = Stopwatch.GetTimestamp();
+            Prof[i] += t - ProfStart;
+            ProfStart = t;
+        }
+#endif
+
+        /// <summary>One border column of the horizontal Gaussian pass — the original
+        /// bounds-checked form, kept verbatim so the partial-edge wsum stays
+        /// bit-identical to the reference.</summary>
+        static void GaussianEdgeH(int[] src, int x, int width, int height, int kr, float[] kernel)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                float sum = 0, wsum = 0;
+                for (int k = -kr; k <= kr; k++)
+                {
+                    int sx = x + k;
+                    if ((uint)sx >= (uint)width) continue;
+                    float kv = kernel[k + kr];
+                    sum += src[sx * height + y] * kv;
+                    wsum += kv;
+                }
+                _bufA[x * height + y] = wsum > 0 ? sum / wsum : 0;
+            }
+        }
+
+        /// <summary>One border element of the vertical Gaussian pass (y near an edge).</summary>
+        static void GaussianEdgeV(int x, int y, int height, int kr, float[] kernel)
+        {
+            float sum = 0, wsum = 0;
+            for (int k = -kr; k <= kr; k++)
+            {
+                int sy = y + k;
+                if ((uint)sy >= (uint)height) continue;
+                float kv = kernel[k + kr];
+                sum += _bufA[x * height + sy] * kv;
+                wsum += kv;
+            }
+            _bufB[x * height + y] = wsum > 0 ? sum / wsum : 0;
         }
 
         public static PressureInfo[] GetPressureInfo(int[] data, int width, int height,
@@ -226,6 +285,9 @@ namespace DevicePipe
                                                       RadiusMode mode, bool enableFilter)
         {
             int inW = width, inH = height;
+#if ALGBENCH_PROF
+            ProfBegin();
+#endif
 
             // Reset temporal filter state on enable/disable or dimension change
             if (enableFilter != _filterWasEnabled ||
@@ -245,42 +307,102 @@ namespace DevicePipe
             // Covers the peak-reduction flood fill as well as the piece-detection
             // buffers, which share _bfsQueue.
             ResizeBufs(width * height);
+#if ALGBENCH_PROF
+            ProfMark(0);   // setup
+#endif
 
             int kr = _kernelRadius;
 
             // Horizontal Gaussian pass: data → _bufA
-            for (int y = 0; y < height; y++)
-                for (int x = 0; x < width; x++)
+            //
+            // data is indexed sx*height + y, so for a fixed y every tap sits one
+            // stride (height floats) apart — the original y-outer loop touched a new
+            // cache line on every x.  Hoisting x outside y keeps the innermost
+            // address contiguous, and the interior columns use a precomputed wsum
+            // (same addition order, so the quotient is bit-identical) with no bounds
+            // test per tap.
+            float[] kernel = _kernel;
+            float wsumFull = 0f;
+            for (int k = -kr; k <= kr; k++) wsumFull += kernel[k + kr];
+            int kw = 2 * kr + 1;
+            EnsureTapRows(kw);
+            int[] tapRow = _tapRow;
+            bool fullOk = wsumFull > 0f;
+            for (int x = kr; x < width - kr; x++)
+            {
+                for (int k = 0; k < kw; k++) tapRow[k] = (x + k - kr) * height;
+                int aBase = x * height;
+                int y = 0, yEnd = height - 3;
+                for (; y < yEnd; y += 4)
                 {
-                    float sum = 0, wsum = 0;
-                    for (int k = -kr; k <= kr; k++)
+                    float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                    for (int k = 0; k < kw; k++)
                     {
-                        int sx = x + k;
-                        if ((uint)sx >= width) continue;
-                        float kv = _kernel[k + kr];
-                        sum += data[sx * height + y] * kv;
-                        wsum += kv;
+                        float kv = kernel[k];
+                        int off = tapRow[k];
+                        s0 += data[off + y] * kv;
+                        s1 += data[off + y + 1] * kv;
+                        s2 += data[off + y + 2] * kv;
+                        s3 += data[off + y + 3] * kv;
                     }
-                    _bufA[x, y] = wsum > 0 ? sum / wsum : 0;
+                    _bufA[aBase + y] = fullOk ? s0 / wsumFull : 0f;
+                    _bufA[aBase + y + 1] = fullOk ? s1 / wsumFull : 0f;
+                    _bufA[aBase + y + 2] = fullOk ? s2 / wsumFull : 0f;
+                    _bufA[aBase + y + 3] = fullOk ? s3 / wsumFull : 0f;
                 }
+                for (; y < height; y++)
+                {
+                    float sum = 0;
+                    for (int k = 0; k < kw; k++) sum += data[tapRow[k] + y] * kernel[k];
+                    _bufA[aBase + y] = fullOk ? sum / wsumFull : 0f;
+                }
+            }
+            for (int x = 0; x < kr && x < width; x++)
+                GaussianEdgeH(data, x, width, height, kr, kernel);
+            for (int x = width - kr < kr ? kr : width - kr; x < width; x++)
+                GaussianEdgeH(data, x, width, height, kr, kernel);
 
-            // Vertical Gaussian pass: _bufA → _bufB
+            // Vertical Gaussian pass: _bufA → _bufB (already contiguous in y)
+#if ALGBENCH_PROF
+            ProfMark(1);   // gaussian horizontal (rows)
+#endif
             for (int x = 0; x < width; x++)
-                for (int y = 0; y < height; y++)
+            {
+                int bBase = x * height;
+                int y = kr, yEnd = height - kr, y4 = yEnd - 3;
+                for (; y < y4; y += 4)
                 {
-                    float sum = 0, wsum = 0;
+                    float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
                     for (int k = -kr; k <= kr; k++)
                     {
-                        int sy = y + k;
-                        if ((uint)sy >= height) continue;
-                        float kv = _kernel[k + kr];
-                        sum += _bufA[x, sy] * kv;
-                        wsum += kv;
+                        float kv = kernel[k + kr];
+                        s0 += _bufA[bBase + y + k] * kv;
+                        s1 += _bufA[bBase + y + 1 + k] * kv;
+                        s2 += _bufA[bBase + y + 2 + k] * kv;
+                        s3 += _bufA[bBase + y + 3 + k] * kv;
                     }
-                    _bufB[x, y] = wsum > 0 ? sum / wsum : 0;
+                    _bufB[bBase + y] = fullOk ? s0 / wsumFull : 0f;
+                    _bufB[bBase + y + 1] = fullOk ? s1 / wsumFull : 0f;
+                    _bufB[bBase + y + 2] = fullOk ? s2 / wsumFull : 0f;
+                    _bufB[bBase + y + 3] = fullOk ? s3 / wsumFull : 0f;
                 }
+                for (; y < yEnd; y++)
+                {
+                    float sum = 0;
+                    for (int k = -kr; k <= kr; k++)
+                        sum += _bufA[bBase + y + k] * kernel[k + kr];
+                    _bufB[bBase + y] = fullOk ? sum / wsumFull : 0f;
+                }
+                for (int yb = 0; yb < kr && yb < height; yb++)
+                    GaussianEdgeV(x, yb, height, kr, kernel);
+                for (int yb = height - kr < kr ? kr : height - kr; yb < height; yb++)
+                    GaussianEdgeV(x, yb, height, kr, kernel);
+            }
 
             // Find local maxima in _bufB
+#if ALGBENCH_PROF
+            ProfMark(2);   // gaussian vertical
+#endif
             var peaks = _peaks;
             peaks.Clear();
             // python maximum_filter(size=Neighborhood) → square half-window; the
@@ -289,23 +411,29 @@ namespace DevicePipe
             // python TOUCH_THRESHOLD=60 while the filter is on, else the C# Threshold
             float thr = enableFilter ? FilterDetectThreshold : Threshold;
             for (int x = 0; x < width; x++)
+            {
+                int rowBase = x * height;
                 for (int y = 0; y < height; y++)
                 {
-                    float v = _bufB[x, y];
+                    float v = _bufB[rowBase + y];
                     if (v <= thr) continue;
                     bool isMax = true;
                     for (int dx = -half; dx <= half && isMax; dx++)
                         for (int dy = -half; dy <= half && isMax; dy++)
                         {
                             int nx = x + dx, ny = y + dy;
-                            if ((uint)nx >= width || (uint)ny >= height) continue;
-                            if (_bufB[nx, ny] > v) { isMax = false; break; }
+                            if ((uint)nx >= (uint)width || (uint)ny >= (uint)height) continue;
+                            if (_bufB[nx * height + ny] > v) { isMax = false; break; }
                         }
                     if (isMax) peaks.Add((x, y, v));
                 }
+            }
 
             // Rank the surviving maxima, then reduce them to one touch each.
             peaks.Sort((a, b) => b.val.CompareTo(a.val));
+#if ALGBENCH_PROF
+            ProfMark(9);   // peak scan + sort
+#endif
             var result = _piScratch;
             result.Clear();
 
@@ -340,6 +468,9 @@ namespace DevicePipe
                 }
                 AddTouches(merged, false, mode);
             }
+#if ALGBENCH_PROF
+            ProfMark(3);   // peak ranking/reduction + AddTouches
+#endif
 
             PressureInfo[] touches = result.ToArray();
             if (enableFilter)
@@ -347,6 +478,9 @@ namespace DevicePipe
                 touches = ApplyTouchFilter(touches, data, inW, inH);
                 touches = ApplyTemporalSmoothing(touches);
             }
+#if ALGBENCH_PROF
+            ProfMark(4);   // piece-guided touch filter + temporal smoothing
+#endif
             return touches;
         }
 
@@ -379,7 +513,7 @@ namespace DevicePipe
         /// Order of the surviving peaks is irrelevant — the caller re-sorts by value.
         /// </summary>
         static List<(int x, int y, float val)> ReduceComponentPeaks(
-            float[,] smoothed, List<(int x, int y, float val)> peaks, int w, int h)
+            float[] smoothed, List<(int x, int y, float val)> peaks, int w, int h)
         {
             int total = w * h;
             if (_peakMark == null || _peakMark.Length < total) _peakMark = new bool[total];
@@ -403,7 +537,7 @@ namespace DevicePipe
                 int head = 0, tail = 0;
                 _bfsQueue[tail++] = seed;
                 int bestIdx = seed;
-                float bestVal = smoothed[seed / h, seed % h];
+                float bestVal = smoothed[seed];
 
                 while (head < tail)
                 {
@@ -418,7 +552,7 @@ namespace DevicePipe
                         _peakMark[nidx] = false;
                         _bfsQueue[tail++] = nidx;
 
-                        float nv = smoothed[nx, ny];
+                        float nv = smoothed[nidx];
                         if (nv > bestVal) { bestVal = nv; bestIdx = nidx; }
                     }
                 }
@@ -487,6 +621,7 @@ namespace DevicePipe
         /// <summary>
         /// Python _apply_peak_hold: cross-kernel dilate (data &gt; 0), then
         /// peak[dilated] = max(peak, data), peak[~dilated] = 0.
+        /// Both halves are element-independent and fused into one sweep.
         /// </summary>
         static void ApplyPeakHold(int[] data, int inW, int inH)
         {
@@ -497,10 +632,10 @@ namespace DevicePipe
                 _peakW = inW;
                 _peakH = inH;
             }
-            if (_dilBuf == null || _dilBuf.Length < total)
-                _dilBuf = new byte[total];
 
             // data layout: idx = x * inW + y  (x ∈ [0, inH), y ∈ [0, inW))
+            // The dilate pass and the peak-hold pass are element-independent, so they
+            // are fused into one sweep (saves a full 80KB read+write round trip).
             for (int x = 0; x < inH; x++)
             {
                 int rowBase = x * inW;
@@ -515,12 +650,11 @@ namespace DevicePipe
                         else if (y > 0 && data[i - 1] > 0) active = true;
                         else if (y + 1 < inW && data[i + 1] > 0) active = true;
                     }
-                    _dilBuf[i] = active ? (byte)1 : (byte)0;
+                    // Mathf.Max(a, b) is `a > b ? a : b`, written out so it inlines.
+                    float pv = _peakBuf[i], dv = data[i];
+                    _peakBuf[i] = active ? (pv > dv ? pv : dv) : 0f;
                 }
             }
-
-            for (int i = 0; i < total; i++)
-                _peakBuf[i] = _dilBuf[i] != 0 ? Mathf.Max(_peakBuf[i], data[i]) : 0f;
         }
 
         /// <summary>
@@ -530,16 +664,30 @@ namespace DevicePipe
         /// </summary>
         static List<(float, float, float)> DetectPieces(int[] data, int inW, int inH)
         {
+#if ALGBENCH_PROF
+            ProfBegin();
+#endif
             ApplyPeakHold(data, inW, inH);
+#if ALGBENCH_PROF
+            ProfMark(6);
+#endif
             int total = inW * inH;
             ResizeBufs(total);
 
             // cv2.threshold(peak_data, SkeletonThresh, 255, THRESH_BINARY)
+            // The label clear rides along here so FindComponents does not have to
+            // sweep the whole buffer again (labels are consumed by the same call).
             for (int i = 0; i < total; i++)
+            {
                 _binBuf[i] = _peakBuf[i] > SkeletonThresh ? (byte)1 : (byte)0;
+                _labelBuf[i] = 0;
+            }
 
             // cv2.findContours(RETR_EXTERNAL) ≈ 8-connected component labeling
             var components = FindComponents(_binBuf, _labelBuf, _bfsQueue, inH, inW);
+#if ALGBENCH_PROF
+            ProfMark(7);
+#endif
 
             // SHARED scratch: valid only until the next DetectPieces call.
             // Both callers (GetPieceInfo, ApplyTouchFilter) consume it immediately.
@@ -548,6 +696,9 @@ namespace DevicePipe
             foreach (var comp in components)
                 if (TryFitPiece(_binBuf, _labelBuf, comp.compId, comp, inH, inW, out var p))
                     pieces.Add(p);
+#if ALGBENCH_PROF
+            ProfMark(8);
+#endif
             return pieces;
         }
 
@@ -567,7 +718,8 @@ namespace DevicePipe
             // contour only, in boundary-walk order. Moore-neighbor tracing gives that
             // ordering; sorting pixel centers by angle inflates the perimeter (consecutive
             // points can sit far apart across staircase corners) and kills circularity.
-            List<(int x, int y)> full = TraceOuterContour(labels, compId, w, h);
+            List<(int x, int y)> full = TraceOuterContour(labels, compId, w, h,
+                                                           comp.startX, comp.startY);
             if (full.Count < 5) return false;
 
             // Then collapse collinear runs, i.e. cv2.CHAIN_APPROX_SIMPLE.  This matters
@@ -675,7 +827,8 @@ namespace DevicePipe
         /// (what cv2.findContours returns). Clockwise probe starting just after the
         /// backtrack pixel; Jacob-style stop on re-entering the start pixel.
         /// </summary>
-        static List<(int x, int y)> TraceOuterContour(int[] labels, int compId, int w, int h)
+        static List<(int x, int y)> TraceOuterContour(int[] labels, int compId, int w, int h,
+                                                       int sx, int sy)
         {
             // SHARED scratch: valid only until the next TraceOuterContour call
             // (TryFitPiece consumes it immediately).
@@ -683,12 +836,10 @@ namespace DevicePipe
             contour.Clear();
             int total = w * h;
 
-            // Start: topmost, then leftmost component pixel
-            int sx = -1, sy = -1;
-            for (int y = 0; y < h && sx < 0; y++)
-                for (int x = 0; x < w; x++)
-                    if (labels[x * h + y] == compId) { sx = x; sy = y; break; }
-            if (sx < 0) return contour;
+            // Start: smallest y, then smallest x — the pixel the labelling pass
+            // recorded (the old code re-scanned the whole frame to find it).
+            if ((uint)sx >= (uint)w || (uint)sy >= (uint)h || labels[sx * h + sy] != compId)
+                return contour;
 
             // Initial backtrack: any direction pointing at background/out of bounds
             int dir = 0;
@@ -788,10 +939,11 @@ namespace DevicePipe
             int maxDist = 50;
 
             int left = 0, right = 0, up = 0, down = 0;
-            while (left < maxDist && cx - left > 0 && _bufB[cx - left - 1, cy] > threshold) left++;
-            while (right < maxDist && cx + right + 1 < _w && _bufB[cx + right + 1, cy] > threshold) right++;
-            while (up < maxDist && cy - up > 0 && _bufB[cx, cy - up - 1] > threshold) up++;
-            while (down < maxDist && cy + down + 1 < _h && _bufB[cx, cy + down + 1] > threshold) down++;
+            int h = _h;
+            while (left < maxDist && cx - left > 0 && _bufB[(cx - left - 1) * h + cy] > threshold) left++;
+            while (right < maxDist && cx + right + 1 < _w && _bufB[(cx + right + 1) * h + cy] > threshold) right++;
+            while (up < maxDist && cy - up > 0 && _bufB[cx * h + (cy - up - 1)] > threshold) up++;
+            while (down < maxDist && cy + down + 1 < h && _bufB[cx * h + (cy + down + 1)] > threshold) down++;
 
             return (left + right + up + down) / 4f + 1f;
         }
@@ -801,10 +953,10 @@ namespace DevicePipe
         /// Grows a square around the peak until any boundary pixel drops below absoluteThreshold.
         /// Used by the touch filter with absoluteThreshold=1 (python: region < 1).
         /// </summary>
-        static float ComputeRadiusBySquare(float[,] smoothed, int cx, int cy, float absoluteThreshold, int maxR = 50)
+        static float ComputeRadiusBySquare(float[] smoothed, int cx, int cy, float absoluteThreshold, int maxR = 50)
         {
-            int h = smoothed.GetLength(1);
-            int w = smoothed.GetLength(0);
+            int h = _h;
+            int w = _w;
             int r = 1;
             while (r < maxR && r < Mathf.Max(w, h))
             {
@@ -816,13 +968,13 @@ namespace DevicePipe
                 bool below = false;
                 for (int x = xMin; x <= xMax && !below; x++)
                 {
-                    if (smoothed[x, yMin] < absoluteThreshold) below = true;
-                    if (smoothed[x, yMax] < absoluteThreshold) below = true;
+                    if (smoothed[x * h + yMin] < absoluteThreshold) below = true;
+                    if (smoothed[x * h + yMax] < absoluteThreshold) below = true;
                 }
                 for (int y = yMin; y <= yMax && !below; y++)
                 {
-                    if (smoothed[xMin, y] < absoluteThreshold) below = true;
-                    if (smoothed[xMax, y] < absoluteThreshold) below = true;
+                    if (smoothed[xMin * h + y] < absoluteThreshold) below = true;
+                    if (smoothed[xMax * h + y] < absoluteThreshold) below = true;
                 }
 
                 if (below && r > 1) break;
@@ -838,9 +990,14 @@ namespace DevicePipe
             public int sumX, sumY;
             public int pixelCount;
             public int compId;
+            /// <summary>Smallest-y (then smallest-x) pixel of the component — the
+            /// exact starting point the contour walk would find by scanning.</summary>
+            public int startX, startY;
         }
 
         /// <summary>BFS connected-component labeling (8-connected).
+        /// <paramref name="labels"/> must already be zeroed by the caller (the
+        /// threshold pass does it in the same sweep).
         /// Returns SHARED scratch _components: valid only until the next
         /// FindComponents call; callers must consume it immediately (and must not
         /// call anything that re-enters FindComponents while iterating).</summary>
@@ -848,7 +1005,6 @@ namespace DevicePipe
             byte[] skeleton, int[] labels, int[] queue, int w, int h)
         {
             int total = w * h;
-            System.Array.Clear(labels, 0, total);
             var components = _components;
             components.Clear();
             int compId = 0;
@@ -863,12 +1019,18 @@ namespace DevicePipe
                 labels[seed] = compId;
 
                 int sumX = 0, sumY = 0, count = 0;
+                // Start pixel for contour tracing: the scan order of
+                // TraceOuterContour is y ascending then x ascending, so track the
+                // smallest y seen and, within it, the smallest x — instead of
+                // re-scanning the whole frame per component later.
+                int stx = -1, sty = -1;
 
                 while (head < tail)
                 {
                     int idx = queue[head++];
                     int x = idx / h, y = idx % h;
                     sumX += x; sumY += y; count++;
+                    if (sty < 0 || y < sty || (y == sty && x < stx)) { stx = x; sty = y; }
 
                     for (int d = 0; d < 8; d++)
                     {
@@ -886,7 +1048,8 @@ namespace DevicePipe
                 {
                     sumX = sumX, sumY = sumY,
                     pixelCount = count,
-                    compId = compId
+                    compId = compId,
+                    startX = stx, startY = sty
                 });
             }
 
@@ -901,7 +1064,13 @@ namespace DevicePipe
 
             // No (width, height) swap: passing the caller's dims here matches the
             // touch-filter path's coordinate frame.
+#if ALGBENCH_PROF
+            ProfBegin();
+#endif
             var pieces = DetectPieces(data, width, height);
+#if ALGBENCH_PROF
+            ProfMark(5);   // DetectPieces (the whole piece path)
+#endif
             if (pieces.Count == 0) return System.Array.Empty<PieceInfo>();
 
             var results = new PieceInfo[pieces.Count];

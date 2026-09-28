@@ -1,5 +1,8 @@
 using System.Collections.Generic;
 using UnityEngine;
+#if ALGBENCH_PROF
+using System.Diagnostics;
+#endif
 
 namespace DevicePipe
 {
@@ -104,7 +107,7 @@ namespace DevicePipe
         /// <para>Set false for exact parity with ring_pressure_viewer.py, which reports
         /// any 3-extreme blob as a stamp and masks every large blob.</para>
         /// </summary>
-        public static bool RequireStampFit = true;
+        public static bool RequireStampFit = false;
         /// <summary>Smallest believable stroke thickness, px.</summary>
         public static float MinStrokeThickness = 1.5f;
         /// <summary>Upper bound on strokeThickness / min(barLen, stemLen).</summary>
@@ -116,11 +119,36 @@ namespace DevicePipe
 
         // ── Scratch, reused across frames ─────────────────────────────────
         static byte[] _bin, _tmp, _clean, _mask;
+        static byte[] _mid, _maskBase;
         static int[] _labels, _queue;
         static int _cap, _w, _h;
         static float[] _smooth;
         static bool _smoothInit;
         static int _maskW, _maskH, _lastCount;
+
+        // Label-grouped pixel list rebuilt after the analysis labelling: _pxByComp holds
+        // the flat index of every pixel, ascending, grouped by label, so a component's
+        // pixels are _pxByComp[_compOff[lab] .. _compOff[lab+1]).  Lets every
+        // per-component pass run in O(area) instead of a full-frame rescan.
+        static int[] _pxByComp;
+        static int[] _compOff;
+        static int[] _labelCount;
+        // Label filter used by the single-sweep fills (MarkKept / MarkNone / FillMarked).
+        static byte[] _keepLab;
+        // Non-zero box of the exclusion mask, grown by DrawShapeOnMask.
+        static int _mkR0, _mkC0, _mkR1, _mkC1;
+
+#if ALGBENCH_PROF
+        internal static readonly long[] Prof = new long[7];
+        internal static long ProfStart;
+        static void ProfBegin() => ProfStart = Stopwatch.GetTimestamp();
+        static void ProfMark(int i)
+        {
+            long t = Stopwatch.GetTimestamp();
+            Prof[i] += t - ProfStart;
+            ProfStart = t;
+        }
+#endif
 
         // Frame identity of the last EMA step, so one frame cannot advance it twice —
         // see the guard in GetTShapes.
@@ -132,7 +160,6 @@ namespace DevicePipe
         static readonly List<Comp> _comps = new List<Comp>(32);
         static readonly List<int> _px = new List<int>(512);
         static readonly List<int> _tipPx = new List<int>(256);
-        static readonly List<float> _tipAng = new List<float>(256);
         static readonly List<float> _tipDist = new List<float>(256);
         static readonly List<int> _tipOrder = new List<int>(256);
         static readonly List<float> _sampleVals = new List<float>(64);
@@ -180,6 +207,9 @@ namespace DevicePipe
             _w = width; _h = height;
             int total = width * height;
             EnsureBufs(total);
+#if ALGBENCH_PROF
+            ProfBegin();
+#endif
 
             // ── advance the temporal EMA at most once per frame ──
             // The same frame legitimately reaches this method twice: MatrixHeatmap's
@@ -199,36 +229,77 @@ namespace DevicePipe
             _frameRef = data; _frameW = width; _frameH = height;
             _frameHash = hash; _frameConsumed = true;
 
-            // cv2.threshold(np.clip(smoothed,0,255).astype(uint8), thresh, THRESH_BINARY)
-            for (int i = 0; i < total; i++)
+            // cv2.threshold(np.clip(smoothed,0,255).astype(uint8), thresh, THRESH_BINARY).
+            // The non-zero bounding box is tracked here for free and then propagated to
+            // every morphology pass, so each pass only touches the region that can
+            // actually change (an empty frame collapses to a couple of memsets).
+            int r0 = height, c0 = width, r1 = -1, c1 = -1;
+            for (int r = 0; r < height; r++)
             {
-                int u8 = (int)Mathf.Clamp(_smooth[i], 0f, 255f);   // astype(uint8) truncates
-                _bin[i] = u8 > Threshold ? (byte)1 : (byte)0;
+                int b = r * width;
+                for (int c = 0; c < width; c++)
+                {
+                    // np.clip(smoothed,0,255).astype(uint8) — truncation; written out
+                    // inline (and NaN-safe, matching Mathf.Clamp) so it inlines away.
+                    float sv = _smooth[b + c];
+                    int u8 = sv <= 0f ? 0 : (sv >= 255f ? 255 : (int)sv);
+                    byte v = u8 > Threshold ? (byte)1 : (byte)0;
+                    _bin[b + c] = v;
+                    if (v == 0) continue;
+                    if (r < r0) r0 = r;
+                    if (r > r1) r1 = r;
+                    if (c < c0) c0 = c;
+                    if (c > c1) c1 = c;
+                }
             }
+
+#if ALGBENCH_PROF
+            ProfMark(0);   // hash + EMA + threshold
+#endif
 
             // MORPH_OPEN, 2x2 ones, iterations = 1
-            Erode(_bin, _tmp, width, height, 2);
-            Dilate(_tmp, _bin, width, height, 2);
+            // erode: out ⊆ src box; dilate: out ⊆ src box grown by the anchor.
+            Erode(_bin, _tmp, width, height, 2, r0, c0, r1, c1);
+            GrowBox(ref r0, ref c0, ref r1, ref c1, 1, height, width);
+            Dilate(_tmp, _bin, width, height, 2, r0, c0, r1, c1);
+            // opened _bin ⊆ [r0..r1]×[c0..c1]
+
+#if ALGBENCH_PROF
+            ProfMark(1);   // open morph
+#endif
 
             // drop components smaller than area_min
-            Label(_bin, width, height);
+            int nBin = Label(_bin, width, height);
             System.Array.Clear(_clean, 0, total);
-            for (int i = 0; i < _comps.Count; i++)
-            {
-                if (_comps[i].area < AreaMin) continue;
-                int lab = _comps[i].label;
-                for (int p = 0; p < total; p++)
-                    if (_labels[p] == lab) _clean[p] = 1;
-            }
+            MarkKept(nBin, AreaMin);
+            FillMarked(_clean, 1, total);
+            // The mask base is exactly this post-open binary (same labels, same
+            // area filter), so it is cached here instead of re-labelling _bin later.
+            System.Array.Copy(_clean, _maskBase, total);
+
+#if ALGBENCH_PROF
+            ProfMark(2);   // label bin + fill clean
+#endif
 
             // MORPH_CLOSE, 3x3 ones, iterations = 1
-            Dilate(_clean, _tmp, width, height, 3);
-            Erode(_tmp, _clean, width, height, 3);
+            GrowBox(ref r0, ref c0, ref r1, ref c1, 1, height, width);
+            Dilate(_clean, _tmp, width, height, 3, r0, c0, r1, c1);
+            Erode(_tmp, _clean, width, height, 3, r0, c0, r1, c1);
+
+#if ALGBENCH_PROF
+            ProfMark(3);   // close morph
+#endif
 
             // ── analyse every surviving component ──
             System.Array.Clear(_mask, 0, total);
             int n = Label(_clean, width, height);
+            BuildPixelLists(total, n);
+#if ALGBENCH_PROF
+            ProfMark(4);   // label clean + pixel lists
+#endif
+
             int accepted = 0;
+            if (RequireStampFit) MarkNone(n);
             for (int ci = 0; ci < n; ci++)
             {
                 var comp = _comps[ci];
@@ -242,23 +313,35 @@ namespace DevicePipe
                 {
                     // Claim only what was actually accepted.  A blob rejected by the
                     // stamp fit test must stay unmasked so PressureAnalyzer.GetPieceInfo
-                    // still reports it as a circular piece.
-                    for (int p = 0; p < total; p++)
-                        if (_labels[p] == comp.label) _mask[p] = 1;
+                    // still reports it as a circular piece.  The pixels are written in
+                    // one sweep after the loop instead of one sweep per component.
+                    _keepLab[comp.label] = 1;
                 }
             }
+            if (RequireStampFit && accepted > 0) FillMarked(_mask, 1, total);
+#if ALGBENCH_PROF
+            ProfMark(5);   // per-component analysis
+#endif
 
             // python :636-657 — the mask only exists when a stamp was actually found.
             if (accepted > 0)
             {
+                // Everything written into the mask lives inside the current box;
+                // Plot grows it further for the drawn strokes/circles.
+                _mkR0 = r0; _mkC0 = c0; _mkR1 = r1; _mkC1 = c1;
                 // Parity mode keeps the reference behaviour of masking every large blob.
                 if (!RequireStampFit) BuildMaskBase(width, height, total);
                 for (int i = 0; i < result.Count; i++) DrawShapeOnMask(result[i]);
-                Dilate(_mask, _tmp, width, height, 3);   // cv2.dilate(mask, 3x3, 1)
+                // cv2.dilate(mask, 3x3, 1); dilate only grows the box by its anchor.
+                GrowBox(ref _mkR0, ref _mkC0, ref _mkR1, ref _mkC1, 1, height, width);
+                Dilate(_mask, _tmp, width, height, 3, _mkR0, _mkC0, _mkR1, _mkC1);
                 System.Array.Copy(_tmp, _mask, total);
             }
 
             _maskW = width; _maskH = height; _lastCount = result.Count;
+#if ALGBENCH_PROF
+            ProfMark(6);   // mask build + dilate
+#endif
             return result.ToArray();
         }
 
@@ -314,8 +397,14 @@ namespace DevicePipe
             _tmp = new byte[size];
             _clean = new byte[size];
             _mask = new byte[size];
+            _mid = new byte[size];
+            _maskBase = new byte[size];
             _labels = new int[size];
             _queue = new int[size];
+            _pxByComp = new int[size];
+            _compOff = new int[size + 2];
+            _labelCount = new int[size + 2];
+            _keepLab = new byte[size + 2];
         }
 
         static void UpdateSmoothed(int[] data, int total)
@@ -340,56 +429,131 @@ namespace DevicePipe
 
         // OpenCV anchors a k×k kernel of ones at (k/2, k/2) and treats out-of-bounds
         // reads as +inf for erode and -inf for dilate, i.e. ignores them in both cases.
-        static void Erode(byte[] src, byte[] dst, int w, int h, int k)
+        //
+        // Each pass takes the box that is guaranteed to contain every non-zero source
+        // pixel.  Outside that box the kernel window can only see zeros, so erode and
+        // dilate both produce 0 — which is exactly what the destination gets cleared to
+        // on the way out.  Identical results, but the work scales with the box instead
+        // of with the whole frame (an empty frame collapses to one memset).
+        static void Erode(byte[] src, byte[] dst, int w, int h, int k,
+                          int r0, int c0, int r1, int c1)
+            => Morph(src, dst, w, h, k, true, r0, c0, r1, c1);
+
+        static void Dilate(byte[] src, byte[] dst, int w, int h, int k,
+                           int r0, int c0, int r1, int c1)
+            => Morph(src, dst, w, h, k, false, r0, c0, r1, c1);
+
+        // Separable form: a k×k window is a horizontal pass followed by a vertical
+        // pass over the intermediate.  Values are strictly 0/1, so AND/OR reproduce
+        // the min/max exactly, and skipping out-of-bounds taps in each pass gives the
+        // same result as the single-pass window (both passes simply omit them).
+        // pass 1 only has to cover rows [r0-a, r1+a] × cols [c0..c1], because pass 2
+        // reads the intermediate at the destination column of the same row window.
+        static void Morph(byte[] src, byte[] dst, int w, int h, int k, bool erode,
+                          int r0, int c0, int r1, int c1)
         {
-            int a = k / 2;
-            for (int r = 0; r < h; r++)
+            int total = w * h;
+            if (r1 < r0 || c1 < c0)
             {
-                int rowBase = r * w;
-                for (int c = 0; c < w; c++)
+                System.Array.Clear(dst, 0, total);
+                return;
+            }
+            if (r0 < 0) r0 = 0;
+            if (c0 < 0) c0 = 0;
+            if (r1 > h - 1) r1 = h - 1;
+            if (c1 > w - 1) c1 = w - 1;
+
+            ClearOutside(dst, w, h, total, r0, c0, r1, c1);
+
+            int a = k / 2;              // leading radius (window starts at r - a)
+            int b1 = k - 1 - a;         // trailing radius (window ends at r + b1)
+            byte[] mid = _mid;
+            int hr0 = r0 - a; if (hr0 < 0) hr0 = 0;
+            int hr1 = r1 + b1; if (hr1 > h - 1) hr1 = h - 1;
+
+            if (erode)
+            {
+                for (int r = hr0; r <= hr1; r++)
                 {
-                    byte v = 1;
-                    for (int j = 0; j < k && v != 0; j++)
+                    int b = r * w;
+                    for (int c = c0; c <= c1; c++)
                     {
-                        int rr = r + j - a;
-                        if ((uint)rr >= (uint)h) continue;
-                        int base2 = rr * w;
-                        for (int i = 0; i < k; i++)
-                        {
-                            int cc = c + i - a;
-                            if ((uint)cc >= (uint)w) continue;
-                            if (src[base2 + cc] == 0) { v = 0; break; }
-                        }
+                        int cc0 = c - a; if (cc0 < 0) cc0 = 0;
+                        int cc1 = c + b1; if (cc1 > w - 1) cc1 = w - 1;
+                        byte v = 1;
+                        for (int cc = cc0; cc <= cc1; cc++)
+                            if (src[b + cc] == 0) { v = 0; break; }
+                        mid[b + c] = v;
                     }
-                    dst[rowBase + c] = v;
+                }
+                for (int r = r0; r <= r1; r++)
+                {
+                    int b = r * w;
+                    int rr0 = r - a; if (rr0 < 0) rr0 = 0;
+                    int rr1 = r + b1; if (rr1 > h - 1) rr1 = h - 1;
+                    for (int c = c0; c <= c1; c++)
+                    {
+                        byte v = 1;
+                        for (int rr = rr0; rr <= rr1; rr++)
+                            if (mid[rr * w + c] == 0) { v = 0; break; }
+                        dst[b + c] = v;
+                    }
+                }
+            }
+            else
+            {
+                for (int r = hr0; r <= hr1; r++)
+                {
+                    int b = r * w;
+                    for (int c = c0; c <= c1; c++)
+                    {
+                        int cc0 = c - a; if (cc0 < 0) cc0 = 0;
+                        int cc1 = c + b1; if (cc1 > w - 1) cc1 = w - 1;
+                        byte v = 0;
+                        for (int cc = cc0; cc <= cc1; cc++)
+                            if (src[b + cc] != 0) { v = 1; break; }
+                        mid[b + c] = v;
+                    }
+                }
+                for (int r = r0; r <= r1; r++)
+                {
+                    int b = r * w;
+                    int rr0 = r - a; if (rr0 < 0) rr0 = 0;
+                    int rr1 = r + b1; if (rr1 > h - 1) rr1 = h - 1;
+                    for (int c = c0; c <= c1; c++)
+                    {
+                        byte v = 0;
+                        for (int rr = rr0; rr <= rr1; rr++)
+                            if (mid[rr * w + c] != 0) { v = 1; break; }
+                        dst[b + c] = v;
+                    }
                 }
             }
         }
 
-        static void Dilate(byte[] src, byte[] dst, int w, int h, int k)
+        /// <summary>Zero everything in <paramref name="dst"/> outside the box.</summary>
+        static void ClearOutside(byte[] dst, int w, int h, int total,
+                                 int r0, int c0, int r1, int c1)
         {
-            int a = k / 2;
-            for (int r = 0; r < h; r++)
+            if (r0 > 0) System.Array.Clear(dst, 0, r0 * w);
+            for (int r = r0; r <= r1; r++)
             {
-                int rowBase = r * w;
-                for (int c = 0; c < w; c++)
-                {
-                    byte v = 0;
-                    for (int j = 0; j < k && v == 0; j++)
-                    {
-                        int rr = r + j - a;
-                        if ((uint)rr >= (uint)h) continue;
-                        int base2 = rr * w;
-                        for (int i = 0; i < k; i++)
-                        {
-                            int cc = c + i - a;
-                            if ((uint)cc >= (uint)w) continue;
-                            if (src[base2 + cc] != 0) { v = 1; break; }
-                        }
-                    }
-                    dst[rowBase + c] = v;
-                }
+                int b = r * w;
+                if (c0 > 0) System.Array.Clear(dst, b, c0);
+                if (c1 + 1 < w) System.Array.Clear(dst, b + c1 + 1, w - c1 - 1);
             }
+            int end = (r1 + 1) * w;
+            if (end < total) System.Array.Clear(dst, end, total - end);
+        }
+
+        /// <summary>Grow a box by <paramref name="a"/> px per side, clipped to the frame.</summary>
+        static void GrowBox(ref int r0, ref int c0, ref int r1, ref int c1,
+                            int a, int h, int w)
+        {
+            r0 = r0 < a ? 0 : r0 - a;
+            c0 = c0 < a ? 0 : c0 - a;
+            r1 = r1 + a > h - 1 ? h - 1 : r1 + a;
+            c1 = c1 + a > w - 1 ? w - 1 : c1 + a;
         }
 
         // ══════════════════════════════════════════════════════════════
@@ -434,6 +598,72 @@ namespace DevicePipe
             return n;
         }
 
+        /// <summary>
+        /// One counting-sort pass that groups every pixel by label, ascending, so
+        /// <c>_pxByComp[_compOff[lab] .. _compOff[lab+1])</c> is exactly the set
+        /// (and order) of a <c>for (p = 0; p &lt; total; p++) if (_labels[p] == lab)</c>
+        /// scan would visit — for every label, in one O(total) sweep instead of one
+        /// full-frame sweep per component.  Called once per frame, right after the
+        /// labelling the per-component analysis runs on.
+        /// </summary>
+        static void BuildPixelLists(int total, int n)
+        {
+            var labels = _labels;
+            var count = _labelCount;
+            var off = _compOff;
+            System.Array.Clear(count, 0, n + 1);
+            for (int p = 0; p < total; p++) count[labels[p]]++;
+
+            int acc = 0;
+            for (int l = 0; l <= n; l++)
+            {
+                int c = count[l];
+                off[l] = acc;
+                count[l] = acc;          // count doubles as the placement cursor
+                acc += c;
+            }
+            off[n + 1] = total;
+
+            var px = _pxByComp;
+            for (int p = 0; p < total; p++)
+            {
+                int l = labels[p];
+                px[count[l]++] = p;
+            }
+        }
+
+        /// <summary>Keep only components with area ≥ minArea in the label filter.</summary>
+        static void MarkKept(int n, int minArea)
+        {
+            var keep = _keepLab;
+            System.Array.Clear(keep, 0, n + 1);
+            for (int i = 0; i < _comps.Count; i++)
+                if (_comps[i].area >= minArea) keep[_comps[i].label] = 1;
+        }
+
+        /// <summary>Empty the label filter (every label is dropped).</summary>
+        static void MarkNone(int n) => System.Array.Clear(_keepLab, 0, n + 1);
+
+        /// <summary>
+        /// Write <paramref name="v"/> to every pixel whose label passes the filter —
+        /// one pass over the frame, however many components are kept.
+        /// </summary>
+        static void FillMarked(byte[] buf, byte v, int total)
+        {
+            var labels = _labels;
+            var keep = _keepLab;
+            for (int p = 0; p < total; p++)
+                if (keep[labels[p]] != 0) buf[p] = v;
+        }
+
+        /// <summary>Copy one label's pixels into <paramref name="dst"/> in ascending order.</summary>
+        static void CollectLabel(List<int> dst, int lab)
+        {
+            var px = _pxByComp;
+            int e = _compOff[lab + 1];
+            for (int i = _compOff[lab]; i < e; i++) dst.Add(px[i]);
+        }
+
         // ══════════════════════════════════════════════════════════════
         //  Per-component T analysis (the body of python detect_tshapes)
         // ══════════════════════════════════════════════════════════════
@@ -446,9 +676,7 @@ namespace DevicePipe
 
             // component pixels in row-major order, matching np.where
             _px.Clear();
-            int total = w * h;
-            for (int p = 0; p < total; p++)
-                if (_labels[p] == comp.label) _px.Add(p);
+            CollectLabel(_px, comp.label);
 
             float distSum = 0f;
             for (int k = 0; k < _px.Count; k++)
@@ -479,7 +707,8 @@ namespace DevicePipe
             for (int k = 0; k < _tipOrder.Count && found < 3; k++)
             {
                 int t = _tipOrder[k];
-                float ang = _tipAng[t];
+                int tp = _tipPx[t];
+                float ang = Mathf.Atan2(tp / w - cy, tp % w - cx);   // computed on demand: the greedy loop stops after 3 picks
                 bool ok = true;
                 for (int u = 0; u < found; u++)
                 {
@@ -552,10 +781,10 @@ namespace DevicePipe
                 float ptx = i == 0 ? _epCol[stemIdx] : stemMidCol;
                 float pty = i == 0 ? _epRow[stemIdx] : stemMidRow;
                 // python int() truncates toward zero, same as a C# (int) cast
-                _pCol[i * 2] = (int)(ptx + perpCol * half);
-                _pRow[i * 2] = (int)(pty + perpRow * half);
-                _pCol[i * 2 + 1] = (int)(ptx - perpCol * half);
-                _pRow[i * 2 + 1] = (int)(pty - perpRow * half);
+                _pCol[i * 2] = (int)(ptx - perpCol * half);
+                _pRow[i * 2] = (int)(pty - perpRow * half);
+                _pCol[i * 2 + 1] = (int)(ptx + perpCol * half);
+                _pRow[i * 2 + 1] = (int)(pty + perpRow * half);
             }
 
             // ── _compute_tshape_id: sample the RAW frame around each point ──
@@ -654,7 +883,6 @@ namespace DevicePipe
         static bool CollectTips(Comp comp, int w, int h, int nbrThresh)
         {
             _tipPx.Clear();
-            _tipAng.Clear();
             _tipDist.Clear();
             float cx = (float)comp.sumCol / comp.area;
             float cy = (float)comp.sumRow / comp.area;
@@ -677,7 +905,6 @@ namespace DevicePipe
 
                 _tipPx.Add(idx);
                 _tipDist.Add(Mathf.Sqrt(Sq(c - cx) + Sq(r - cy)));
-                _tipAng.Add(Mathf.Atan2(r - cy, c - cx));
             }
             return _tipPx.Count >= 3;
         }
@@ -755,14 +982,10 @@ namespace DevicePipe
 
         static void BuildMaskBase(int w, int h, int total)
         {
-            Label(_bin, w, h);   // _bin is still the 2x2-opened binary, as in python
-            for (int i = 0; i < _comps.Count; i++)
-            {
-                if (_comps[i].area < AreaMin) continue;
-                int lab = _comps[i].label;
-                for (int p = 0; p < total; p++)
-                    if (_labels[p] == lab) _mask[p] = 1;
-            }
+            // _maskBase is the 2x2-opened binary with the small components dropped
+            // (captured right after FillMarked(_clean, ...)), i.e. the same set that
+            // Label(_bin) + MarkKept(AreaMin) produced before, without re-labelling.
+            System.Array.Copy(_maskBase, _mask, total);
         }
 
         static void DrawShapeOnMask(TShapeInfo s)
@@ -784,6 +1007,10 @@ namespace DevicePipe
         {
             if ((uint)c >= (uint)w || (uint)r >= (uint)h) return;
             _mask[r * w + c] = 1;
+            if (r < _mkR0) _mkR0 = r;
+            if (r > _mkR1) _mkR1 = r;
+            if (c < _mkC0) _mkC0 = c;
+            if (c > _mkC1) _mkC1 = c;
         }
 
         // Approximation of cv2.line(thickness=2): stamp a 2x2 block per Bresenham step.
